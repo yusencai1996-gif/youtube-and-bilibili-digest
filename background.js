@@ -1960,7 +1960,7 @@ function bilibiliTranscriptResult(video, transcript, language, source) {
     coverage: { endSeconds, videoDuration: video.duration,
       possiblyPartial: video.duration - endSeconds > Math.max(30, video.duration * 0.05) }, warnings: [] };
 }
-function selectBilibiliTrack(tracks, cid) {
+function selectBilibiliTrack(tracks, cid, preferredLan = "") {
   if (!Array.isArray(tracks)) throw bilibiliError("INVALID_RESPONSE");
   const valid = [];
   let mismatch = false;
@@ -1978,7 +1978,17 @@ function selectBilibiliTrack(tracks, cid) {
         id: String(track.id_str ?? track.id ?? "") });
     } catch (error) { if (error.code !== "SUBTITLE_MISMATCH") throw error; mismatch = true; }
   }
-  valid.sort((a, b) => Number(/^zh/i.test(a.language)) - Number(/^zh/i.test(b.language)) ||
+  // Track order: the player's own default language first (mirrors what the
+  // user sees in the Bilibili CC menu), then English before other foreign
+  // languages (learning-friendly default), Chinese last unless preferred.
+  const preferred = preferredLan ? bilibiliLanguage(preferredLan) : "";
+  const rank = (track) => {
+    if (preferred && track.language === preferred) return 0;
+    if (track.language === "en") return 1;
+    if (/^zh/i.test(track.language)) return 3;
+    return 2;
+  };
+  valid.sort((a, b) => rank(a) - rank(b) ||
     a.language.localeCompare(b.language) || Number(a.source === "ai") - Number(b.source === "ai") || a.id.localeCompare(b.id));
   return { track: valid[0], mismatch, pending };
 }
@@ -2198,7 +2208,9 @@ async function fetchBilibiliTranscript(tabId, supplied, task) {
     for (let attempt = 0; attempt < 2; attempt++) {
       const data = await bilibiliSignedRequest("/x/player/wbi/v2", { bvid: video.bvid, cid: video.cid }, task, nav);
       if (!data.subtitle || !Array.isArray(data.subtitle.subtitles)) throw bilibiliError("INVALID_RESPONSE");
-      const selected = selectBilibiliTrack(data.subtitle.subtitles, video.cid);
+      // The player's current default subtitle language (e.g. "ai-zh") keeps
+      // the panel aligned with what the Bilibili CC menu shows the user.
+      const selected = selectBilibiliTrack(data.subtitle.subtitles, video.cid, data.subtitle.lan || "");
       pending ||= selected.pending;
       if (!selected.track) break;
       const { track } = selected;

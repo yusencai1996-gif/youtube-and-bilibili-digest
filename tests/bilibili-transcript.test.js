@@ -109,6 +109,20 @@ test("empty or und language tracks are mismatches and cannot outrank valid Chine
     assert.equal(selected.mismatch, true); assert.equal(selected.track.language, "zh-CN");
   }
 });
+test("track selection mirrors the player default, then English, never Arabic-first", () => {
+  const url = (name) => `https://i0.hdslb.com/bfs/subtitle/${name}.json`;
+  const multi = [
+    { lan: "ai-ar", subtitle_url: url("aaa") },
+    { lan: "ai-zh", subtitle_url: url("bbb") },
+    { lan: "ai-en", subtitle_url: url("ccc") },
+    { lan: "ai-ja", subtitle_url: url("ddd") },
+  ];
+  assert.equal(s.selectBilibiliTrack(multi, "222", "ai-zh").track.language, "zh-CN");
+  assert.equal(s.selectBilibiliTrack(multi, "222", "").track.language, "en");
+  assert.equal(s.selectBilibiliTrack(multi, "222", "ai-en").track.language, "en");
+  assert.equal(s.selectBilibiliTrack(multi, "222", "ai-ja").track.language, "ja");
+  assert.equal(s.selectBilibiliTrack(multi, "222").track.language, "en");
+});
 test("ASR reads only subtitle parts and distinguishes empty from damaged data", () => {
   const rows = s.convertBilibiliASR({ code: 0, model_result: { summary: "ignore", subtitle: [{ part_subtitle: [
     { content: "转写", start_timestamp: 1.2, end_timestamp: 3.8 },
