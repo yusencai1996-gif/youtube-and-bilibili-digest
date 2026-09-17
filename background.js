@@ -1978,15 +1978,16 @@ function selectBilibiliTrack(tracks, cid, preferredLan = "") {
         id: String(track.id_str ?? track.id ?? "") });
     } catch (error) { if (error.code !== "SUBTITLE_MISMATCH") throw error; mismatch = true; }
   }
-  // Track order: the player's own default language first (mirrors what the
-  // user sees in the Bilibili CC menu), then English before other foreign
-  // languages (learning-friendly default), Chinese last unless preferred.
+  // Track order: Chinese first — Bilibili AI tracks are pre-translated, so a
+  // zh track means zero DeepSeek translation cost for the user (2026-09-17
+  // product decision). Then the player's default language, then English,
+  // then other foreign languages.
   const preferred = preferredLan ? bilibiliLanguage(preferredLan) : "";
   const rank = (track) => {
-    if (preferred && track.language === preferred) return 0;
-    if (track.language === "en") return 1;
-    if (/^zh/i.test(track.language)) return 3;
-    return 2;
+    if (/^zh/i.test(track.language)) return 0;
+    if (preferred && track.language === preferred) return 1;
+    if (track.language === "en") return 2;
+    return 3;
   };
   valid.sort((a, b) => rank(a) - rank(b) ||
     a.language.localeCompare(b.language) || Number(a.source === "ai") - Number(b.source === "ai") || a.id.localeCompare(b.id));

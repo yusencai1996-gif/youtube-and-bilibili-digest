@@ -109,7 +109,7 @@ test("empty or und language tracks are mismatches and cannot outrank valid Chine
     assert.equal(selected.mismatch, true); assert.equal(selected.track.language, "zh-CN");
   }
 });
-test("track selection mirrors the player default, then English, never Arabic-first", () => {
+test("track selection prefers Chinese (free AI translation), then player default, then English", () => {
   const url = (name) => `https://i0.hdslb.com/bfs/subtitle/${name}.json`;
   const multi = [
     { lan: "ai-ar", subtitle_url: url("aaa") },
@@ -117,11 +117,19 @@ test("track selection mirrors the player default, then English, never Arabic-fir
     { lan: "ai-en", subtitle_url: url("ccc") },
     { lan: "ai-ja", subtitle_url: url("ddd") },
   ];
-  assert.equal(s.selectBilibiliTrack(multi, "222", "ai-zh").track.language, "zh-CN");
-  assert.equal(s.selectBilibiliTrack(multi, "222", "").track.language, "en");
-  assert.equal(s.selectBilibiliTrack(multi, "222", "ai-en").track.language, "en");
-  assert.equal(s.selectBilibiliTrack(multi, "222", "ai-ja").track.language, "ja");
-  assert.equal(s.selectBilibiliTrack(multi, "222").track.language, "en");
+  // Chinese wins regardless of the player default: the zh AI track is a free
+  // pre-translated transcript, so no DeepSeek translation cost is incurred.
+  for (const preferredLan of ["ai-zh", "", "ai-en", "ai-ja", "ai-ar"]) {
+    assert.equal(s.selectBilibiliTrack(multi, "222", preferredLan).track.language, "zh-CN");
+  }
+  const foreignOnly = [
+    { lan: "ai-ar", subtitle_url: url("aaa") },
+    { lan: "ai-en", subtitle_url: url("ccc") },
+    { lan: "ai-ja", subtitle_url: url("ddd") },
+  ];
+  assert.equal(s.selectBilibiliTrack(foreignOnly, "222", "ai-ja").track.language, "ja");
+  assert.equal(s.selectBilibiliTrack(foreignOnly, "222", "").track.language, "en");
+  assert.equal(s.selectBilibiliTrack(foreignOnly, "222").track.language, "en");
 });
 test("ASR reads only subtitle parts and distinguishes empty from damaged data", () => {
   const rows = s.convertBilibiliASR({ code: 0, model_result: { summary: "ignore", subtitle: [{ part_subtitle: [
@@ -132,10 +140,12 @@ test("ASR reads only subtitle parts and distinguishes empty from damaged data", 
   for (const data of [{}, { code: 0, model_result: { subtitle: [{}] } }, { code: 0, model_result: { subtitle: [{ part_subtitle: [{ content: "bad" }] }] } }])
     assert.throws(() => s.convertBilibiliASR(data), { code: "INVALID_RESPONSE" });
 });
-test("track order prefers original then manual within language, id_str and safe URL", () => {
+test("track order prefers Chinese first, then manual within language, id_str and safe URL", () => {
   const track = (lan, id_str) => ({ lan, id_str, subtitle_url: "//x.hdslb.com/222.json" });
   const selected = s.selectBilibiliTrack([track("zh-CN", "1"), track("ai-en", "2"), track("en", "3")], "222").track;
-  assert.equal(selected.id, "3"); assert.equal(selected.source, "cc");
+  assert.equal(selected.id, "1"); assert.equal(selected.language, "zh-CN");
+  const foreign = s.selectBilibiliTrack([track("ai-en", "2"), track("en", "3")], "222").track;
+  assert.equal(foreign.id, "3"); assert.equal(foreign.source, "cc");
   assert.equal(s.selectBilibiliTrack([track("ai-zh", "1")], "222").track.language, "zh-CN");
   assert.equal(s.selectBilibiliTrack([{ ...track("en", "1"), subtitle_url: "https://evil/222" }], "222").mismatch, true);
 });
