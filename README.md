@@ -15,9 +15,13 @@ Turn YouTube and Bilibili videos into resources for deep learning. daweige diges
 
 daweige digest is a bring-your-own-key project installed locally from GitHub. It is not available through the Chrome Web Store, does not include API credits, and does not run a developer-operated server.
 
-![daweige digest Bilibili demo](daweige-digest-demo-bilibili.jpg)
+![daweige digest Bilibili transcript demo](daweige-digest-demo-bilibili-transcript.png)
 
-![daweige digest YouTube demo](daweige-digest-demo-youtube.jpg)
+![daweige digest Bilibili overview demo](daweige-digest-demo-bilibili.jpg)
+
+![daweige digest YouTube transcript demo](daweige-digest-demo-youtube-transcript.png)
+
+![daweige digest YouTube overview demo](daweige-digest-demo-youtube.jpg)
 
 ## New in v1.3.0
 

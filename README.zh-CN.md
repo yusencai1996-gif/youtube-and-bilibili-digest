@@ -15,9 +15,13 @@
 
 daweige digest 是一个需要自行提供 API Key 的开源项目，通过 GitHub 安装。目前没有上架 Chrome 应用商店，不赠送 API 额度，也没有开发者运营的服务器。
 
-![daweige digest B 站演示](daweige-digest-demo-bilibili.jpg)
+![daweige digest B 站字幕演示](daweige-digest-demo-bilibili-transcript.png)
 
-![daweige digest YouTube 演示](daweige-digest-demo-youtube.jpg)
+![daweige digest B 站概览演示](daweige-digest-demo-bilibili.jpg)
+
+![daweige digest YouTube 字幕演示](daweige-digest-demo-youtube-transcript.png)
+
+![daweige digest YouTube 概览演示](daweige-digest-demo-youtube.jpg)
 
 ## v1.3.0 更新
 
