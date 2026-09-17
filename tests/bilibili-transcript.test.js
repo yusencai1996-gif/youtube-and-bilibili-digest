@@ -47,9 +47,12 @@ test("manual CC hashes need no cid but explicit numeric tokens must all match", 
     assert.equal(rejected.mismatch, true); assert.equal(rejected.track, undefined);
   }
 });
-test("AI language prefix or path segment requires a matching path cid", () => {
+test("AI hash filenames follow the same standalone-token rule as manual CC", () => {
   for (const [lan, prefix] of [["ai-en", "subtitle"], ["en", "ai_subtitle"]]) {
-    for (const filename of ["hash", "999", "1222", "2221"]) {
+    const hash = `https://i0.hdslb.com/bfs/${prefix}/d481a7f8c5e2c1e8.json`;
+    assert.equal(s.validateSubtitleUrl(hash, "222", lan), hash);
+    assert.equal(s.selectBilibiliTrack([{ lan, subtitle_url: hash }], "222").track.source, "ai");
+    for (const filename of ["999", "1222", "2221"]) {
       const subtitle_url = `https://i0.hdslb.com/bfs/${prefix}/${filename}.json?cid=222`;
       assert.throws(() => s.validateSubtitleUrl(subtitle_url, "222", lan), { code: "SUBTITLE_MISMATCH" });
       assert.equal(s.selectBilibiliTrack([{ lan, subtitle_url }], "222").track, undefined);
@@ -57,6 +60,17 @@ test("AI language prefix or path segment requires a matching path cid", () => {
     const selected = s.selectBilibiliTrack([{ lan, subtitle_url: `https://i0.hdslb.com/bfs/${prefix}/222.json` }], "222");
     assert.equal(selected.mismatch, false); assert.equal(selected.track.source, "ai");
   }
+});
+test("live AI subtitle URLs without a standalone cid pass (2026-09-17 regression)", () => {
+  // Shapes captured from a live video (cid 41126921074): pure-hash names for
+  // ai-en/ja/es/ar, and the cid embedded inside a longer digit run for ai-zh.
+  const zhEmbedded = "https://aisubtitle.hdslb.com/bfs/ai_subtitle/prod/117132750948219411269210741bd35bb057fddc87be3.json";
+  for (const lan of ["ai-zh", "ai-en", "ai-ja", "ai-es", "ai-ar"]) {
+    const url = lan === "ai-zh" ? zhEmbedded : `https://aisubtitle.hdslb.com/bfs/ai_subtitle/prod/${"a1b2c3d4".repeat(4)}.json`;
+    assert.equal(s.validateSubtitleUrl(url, "41126921074", lan), url);
+    assert.equal(s.selectBilibiliTrack([{ lan, subtitle_url: url }], "41126921074").mismatch, false);
+  }
+  assert.throws(() => s.validateSubtitleUrl("https://aisubtitle.hdslb.com/bfs/ai_subtitle/prod/999/x.json", "41126921074", "ai-zh"), { code: "SUBTITLE_MISMATCH" });
 });
 test("BCC text-only access notices are unavailable, while empty and malformed bodies stay distinct", () => {
   for (const body of [[{ content: "【稿件无法观看】" }], [{ content: "视频不可观看" }, { content: "请稍后重试" }]])

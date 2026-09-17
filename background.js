@@ -1902,16 +1902,14 @@ function validateSubtitleUrl(value, cid, language = "") {
   try { url = new URL(value.startsWith("//") ? `https:${value}` : value); } catch { throw bilibiliError("SUBTITLE_MISMATCH"); }
   if (url.protocol !== "https:" || url.username || url.password || url.port ||
       !url.hostname.endsWith(".hdslb.com")) throw bilibiliError("SUBTITLE_MISMATCH");
-  const isAI = /^ai-/i.test(language) || /(?:^|\/)ai_subtitle(?:\/|$)/i.test(url.pathname);
-  if (isAI) {
-    if (!new RegExp(`(^|[^0-9])${cid}([^0-9]|$)`).test(url.pathname)) throw bilibiliError("SUBTITLE_MISMATCH");
-  } else {
-    // Manual CC filenames are hashes; only standalone numeric tokens claim a cid.
-    // Intentionally allow hex hashes: <letter><cid>.json is not a standalone token.
-    // Accepted boundary: host allowlist + official wbi/v2 lists only + legacy API disabled.
-    const tokens = [...url.pathname.matchAll(/(?:^|[^a-z0-9])([0-9]+)(?=[^a-z0-9]|$)/gi)];
-    if (tokens.some((match) => match[1] !== String(cid))) throw bilibiliError("SUBTITLE_MISMATCH");
-  }
+  // Filenames are hashes for manual CC and AI tracks alike; real-world AI URLs
+  // do not carry the cid as a standalone token (verified against a live video
+  // on 2026-09-17, where all five ai-* tracks used pure-hash names). The cid
+  // gate stays as defense in depth: any standalone numeric token must match
+  // the current video. Hard guarantees are unchanged: host allowlist, official
+  // wbi/v2 lists only, legacy API disabled, redirects rejected.
+  const tokens = [...url.pathname.matchAll(/(?:^|[^a-z0-9])([0-9]+)(?=[^a-z0-9]|$)/gi)];
+  if (tokens.some((match) => match[1] !== String(cid))) throw bilibiliError("SUBTITLE_MISMATCH");
   return url.href;
 }
 function bilibiliLanguage(value) {

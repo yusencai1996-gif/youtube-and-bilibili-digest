@@ -155,13 +155,15 @@ test("manual CC hash URL downloads without cid and still forbids redirects", asy
   assert.equal((await fetchVideo(d)).error.code, "NETWORK_ERROR"); assert.equal(d.calls.length, 4);
   assert.equal(d.calls[3].options.redirect, "error");
 });
-test("AI tracks missing or mismatching cid never download, for either AI indicator", async () => {
+test("AI hash filenames download without a standalone cid; foreign tokens are still rejected", async () => {
   for (const [lan, prefix] of [["ai-en", "subtitle"], ["en", "ai_subtitle"]]) {
-    for (const filename of ["hash", "999"]) {
-      const c = harness(chain(tracks(lan, `https://i0.hdslb.com/bfs/${prefix}/${filename}.json?cid=222`), reply(envelope({ code: -1 }))));
-      assert.equal((await fetchVideo(c)).status, "no-subtitle");
-      assert.ok(c.calls.every((call) => !call.url.includes("hdslb")));
-    }
+    const c = harness(chain(tracks(lan, `https://i0.hdslb.com/bfs/${prefix}/d481a7f8c5e2c1e8.json`)));
+    const result = await fetchVideo(c);
+    assert.equal(result.status, "ready");
+    assert.equal(result.source, "ai");
+    const d = harness(chain(tracks(lan, `https://i0.hdslb.com/bfs/${prefix}/999.json?cid=222`), reply(envelope({ code: -1 }))));
+    assert.equal((await fetchVideo(d)).status, "no-subtitle");
+    assert.ok(d.calls.every((call) => !call.url.includes("hdslb")));
   }
 });
 test("text-only blocked BCC reports video unavailable; empty BCC falls back to no-subtitle", async () => {
