@@ -1,27 +1,30 @@
-# YouTube Digest
+# daweige digest
 
 [English](README.md) | [简体中文](README.zh-CN.md)
 
-Turn every YouTube video into a resource for deep learning. YouTube Digest brings transcripts, bilingual translation, AI overviews, explanations, and timestamped notes into one Chrome side panel, so you can study ideas and language without losing your place.
+> Fork of [zarazhangrui/youtube-digest](https://github.com/zarazhangrui/youtube-digest) (MIT), rebranded as daweige digest. The source repository is still [github.com/zarazhangrui/youtube-digest](https://github.com/zarazhangrui/youtube-digest).
 
-- Turn captions into a readable, searchable learning resource.
+Turn YouTube and Bilibili videos into resources for deep learning. daweige digest brings transcripts, bilingual translation, AI overviews, explanations, and timestamped notes into one Chrome or Edge side panel, so you can study ideas and language without losing your place.
+
+- Turn captions into a readable, searchable learning resource, on YouTube and Bilibili alike.
 - Learn languages with the original transcript, a Simplified Chinese translation, or an aligned bilingual view.
 - Build understanding with an AI overview, chapters, key quotes, and selected-text explanations.
 - Navigate long videos by clicking timestamps in the transcript, overview, or notes.
 - Save polished timestamped notes for later study.
-- Keep control of your data with your own API keys, local Chrome storage, and no analytics or telemetry.
+- Keep control of your data with your own API keys, local browser storage, and no analytics or telemetry.
 
-YouTube Digest is a bring-your-own-key project installed locally from GitHub. It is not available through the Chrome Web Store, does not include API credits, and does not run a developer-operated server.
+daweige digest is a bring-your-own-key project installed locally from GitHub. It is not available through the Chrome Web Store, does not include API credits, and does not run a developer-operated server.
 
-![YouTube Digest demo](YouTube%20Digest%20demo.png)
+![daweige digest Bilibili demo](daweige-digest-demo-bilibili.jpg)
 
-## New in v1.2.0
+![daweige digest YouTube demo](daweige-digest-demo-youtube.jpg)
 
-- Search transcript words or phrases and move through every match.
-- Use one Original, Chinese, or bilingual setting across Transcript, Overview, and Notes. New videos stay in Original by default.
-- Translate visible Overview and Notes content progressively in small cached batches.
-- Explain selected transcript text or save it directly as a timestamped note.
-- Keep your transcript position across navigation, with the panel closing automatically outside YouTube video pages.
+## New in v1.3.0
+
+- Bilibili support: transcripts, AI overviews, selected-text explanations, timestamped notes, and translation on bilibili.com video pages, with no extra API key: just be logged in to bilibili.com in the same browser.
+- Full interface localization: the whole sidebar now follows your language choice (English or Simplified Chinese), switching instantly.
+- Microsoft Edge support: load the same unpacked folder from `edge://extensions`.
+- Rebranded as daweige digest; videos without subtitles get a clear notice instead of an error.
 
 ## Install with your coding agent
 
@@ -39,7 +42,7 @@ Your agent should:
 
 Keep this folder in the same place after installation. If you move or delete it, Chrome's unpacked extension stops working until you load the extension again from its new permanent folder.
 
-Never paste an API key into an AI chat, source file, screenshot, or public message. Enter keys yourself, directly in the YouTube Digest Settings page. Your coding agent can point to the correct field without seeing the key.
+Never paste an API key into an AI chat, source file, screenshot, or public message. Enter keys yourself, directly in the daweige digest Settings page. Your coding agent can point to the correct field without seeing the key.
 
 ## Install manually
 
@@ -48,20 +51,20 @@ If you prefer to do it yourself:
 1. Open [github.com/zarazhangrui/youtube-digest](https://github.com/zarazhangrui/youtube-digest).
 2. Choose **Code**, then **Download ZIP**.
 3. Choose a permanent folder and unzip the project there. Optional suggestions are `~/Documents/youtube-digest` on macOS or Linux, or `%USERPROFILE%\Documents\youtube-digest` on Windows. You may use a different folder.
-4. In Chrome, open `chrome://extensions`.
+4. In Chrome, open `chrome://extensions`. In Microsoft Edge, open `edge://extensions` instead.
 5. Turn on **Developer mode**.
 6. Click **Load unpacked**.
 7. Select the exact project folder you chose, which must contain `manifest.json`.
-8. Pin YouTube Digest from Chrome's Extensions menu if you want quick access.
+8. Pin daweige digest from the browser's Extensions menu if you want quick access.
 
-Because this is an unpacked extension, it does not update automatically. After downloading an update or changing local files, click **Reload** on the YouTube Digest card at `chrome://extensions`, then refresh open YouTube tabs. Moving or deleting the source folder breaks the unpacked extension until you load it again from the new location.
+Because this is an unpacked extension, it does not update automatically. After downloading an update or changing local files, click **Reload** on the daweige digest card at `chrome://extensions` (or `edge://extensions` in Edge), then refresh open YouTube tabs. Moving or deleting the source folder breaks the unpacked extension until you load it again from the new location.
 
 ## Set up your API keys
 
-YouTube Digest needs two keys under your own provider accounts:
+daweige digest uses at most two keys under your own provider accounts:
 
-1. A **Supadata API key** to retrieve YouTube transcripts.
-2. A **DeepSeek API key** for overviews, explanations, translation, and automatic note polishing.
+1. A **DeepSeek API key** for overviews, explanations, translation, and automatic note polishing.
+2. A **Supadata API key** to retrieve YouTube transcripts. Supadata is only needed for YouTube: Bilibili subtitles work without any Supadata key.
 
 ### Get a Supadata API key
 
@@ -69,7 +72,7 @@ YouTube Digest needs two keys under your own provider accounts:
 2. Create an account and complete the short onboarding flow.
 3. Supadata generates an API key automatically during onboarding.
 4. Open the [Supadata dashboard](https://dash.supadata.ai/) whenever you need to find or manage the key.
-5. Copy the key and paste it into **Supadata API key** in YouTube Digest Settings.
+5. Copy the key and paste it into **Supadata API key** in daweige digest Settings.
 
 See the [official Supadata documentation](https://docs.supadata.ai/) if the dashboard flow changes.
 
@@ -77,14 +80,14 @@ See the [official Supadata documentation](https://docs.supadata.ai/) if the dash
 
 1. Open the official [DeepSeek API Keys page](https://platform.deepseek.com/api_keys).
 2. Sign in or create a DeepSeek Platform account when prompted.
-3. Choose **Create new API key**, give it a recognizable name such as `YouTube Digest`, and create it.
+3. Choose **Create new API key**, give it a recognizable name such as `daweige digest`, and create it.
 4. Copy the key immediately. The full key may only be shown once.
-5. Paste it into **DeepSeek API key** in YouTube Digest Settings.
+5. Paste it into **DeepSeek API key** in daweige digest Settings.
 6. If DeepSeek reports insufficient balance, add credit in your DeepSeek Platform account and try again.
 
 See the [official DeepSeek API documentation](https://api-docs.deepseek.com/) for current account and API details.
 
-Open **Settings** from the side panel. You can also open the YouTube Digest **Options** page from its card at `chrome://extensions` or by right-clicking its toolbar icon. Paste keys only into these Settings fields. Never paste a key into an AI chat, repository file, screenshot, or public message.
+Open **Settings** from the side panel. You can also open the daweige digest **Options** page from its card at `chrome://extensions` or by right-clicking its toolbar icon. Paste keys only into these Settings fields. Never paste a key into an AI chat, repository file, screenshot, or public message.
 
 The published version supports DeepSeek V4 Flash as its only AI provider:
 
@@ -93,32 +96,35 @@ Base URL: https://api.deepseek.com
 Model: deepseek-v4-flash
 ```
 
-YouTube Digest sends every DeepSeek request in non-thinking mode for responsive, predictable interactions. The endpoint and model are fixed in Settings, so the only AI credential you enter is your DeepSeek API key. To use another provider or model, copy the safe customization prompt in Settings and give it to a coding agent for your local copy. Never add an API key to that prompt or chat.
+daweige digest sends every DeepSeek request in non-thinking mode for responsive, predictable interactions. The endpoint and model are fixed in Settings, so the only AI credential you enter is your DeepSeek API key. To use another provider or model, copy the safe customization prompt in Settings and give it to a coding agent for your local copy. Never add an API key to that prompt or chat.
 
 Keys and settings are stored in Chrome's local extension storage on your device. Release builds do not include or use `config.js`.
 
-## Use YouTube Digest
+## Use daweige digest
 
-1. Open a standard YouTube watch page with captions.
-2. Click the YouTube Digest extension icon to open the side panel.
+1. Open a standard YouTube watch page with captions, or a Bilibili video page.
+2. Click the daweige digest extension icon to open the side panel.
 3. Read the timestamped transcript, or choose **Original**, **中文**, or **双语**.
 4. Open **Overview** when you want AI-generated chapters and key quotes.
 5. Select transcript text when you want an AI explanation.
 6. Save a note from the player or a key quote, then revisit it from **Notes**.
 
+The Settings page offers English and 中文 interface languages. The side panel, Settings page, and error messages all follow that one choice.
+
 ## What works today
 
-- Google Chrome 116 or newer, using the Side Panel API.
+- Google Chrome 116 or newer, using the Side Panel API. Microsoft Edge (Chromium) can load the extension through `edge://extensions`.
 - Standard `youtube.com/watch` video pages.
-- Native subtitle tracks returned by Supadata. YouTube Digest prefers English when available, but may show another native language.
+- Bilibili video pages (`bilibili.com/video/...`), including multi-part videos. Bilibili transcripts are fetched through your own Bilibili login session in the browser, so you need to be logged in to Bilibili; no API key is required for this path.
+- Native subtitle tracks returned by Supadata. daweige digest prefers English when available, but may show another native language.
 - Original, Simplified Chinese, and aligned bilingual transcript views.
 - AI overviews, selected-text explanations, translation, and automatic note polishing.
 - Local notes and a local cache for recent transcript and digest results.
 - DeepSeek V4 Flash for all published AI features. Other providers require a local code adaptation and are not supported by this published version.
 
-Shorts, live streams, private or access-restricted videos, and videos without an available native transcript may not work. Firefox, Safari, mobile browsers, and other Chromium browsers are not currently tested or supported.
+Shorts, live streams, private or access-restricted videos, and videos without an available native transcript may not work. On Bilibili, videos without CC or AI subtitles show a neutral no-subtitle state instead of a transcript. Firefox, Safari, and mobile browsers are not currently tested or supported.
 
-YouTube Digest forces Supadata's `mode=native`. It does not request AI-generated transcripts or perform local audio transcription when native captions are unavailable.
+daweige digest forces Supadata's `mode=native`. It does not request AI-generated transcripts or perform local audio transcription when native captions are unavailable.
 
 ## Supadata free tier and request costs
 
@@ -127,12 +133,12 @@ Current as of August 9, 2026, the [Supadata pricing page](https://supadata.ai/pr
 The [Supadata transcript documentation](https://docs.supadata.ai/get-transcript) describes the transcript request modes and credit behavior:
 
 - A native transcript request uses **1 credit**, regardless of video duration.
-- A generated transcript costs **2 credits per video minute**. YouTube Digest does not use this path because it forces `mode=native`.
+- A generated transcript costs **2 credits per video minute**. daweige digest does not use this path because it forces `mode=native`.
 - An unavailable native lookup returned as HTTP `206` still uses **1 credit**.
 
 With the current native-only behavior, the free tier can cover roughly 100 transcript lookups per month when each request succeeds once. Retries and unavailable-caption lookups also consume credits, so actual successful-video coverage can be lower.
 
-DeepSeek usage is separate from Supadata. YouTube Digest does not collect payments or resell access. Set spending limits and monitor both accounts.
+DeepSeek usage is separate from Supadata. daweige digest does not collect payments or resell access. Set spending limits and monitor both accounts.
 
 ## DeepSeek V4 Flash pricing
 
@@ -157,7 +163,7 @@ The lower end assumes most repeated input hits DeepSeek's cache. The upper end a
 
 This is a personal remix project. Upstream issues and pull requests are not accepted. If something breaks or you want a new feature, download or fork your own copy and ask your coding agent to fix, remix, or personalize it for you.
 
-YouTube Digest uses plain HTML, CSS, and JavaScript with no build step, so it is a friendly starting point for agent-assisted projects. Ideas to try:
+daweige digest uses plain HTML, CSS, and JavaScript with no build step, so it is a friendly starting point for agent-assisted projects. Ideas to try:
 
 - Add more translation languages and let each person choose a learning language.
 - Create customized summary templates for lectures, interviews, tutorials, reviews, or research talks.
@@ -169,24 +175,24 @@ YouTube Digest uses plain HTML, CSS, and JavaScript with no build step, so it is
 
 Ask your agent to preserve the bring-your-own-key model, keep secrets out of source files, run the checks below, and test the remix on real videos.
 
-If you want another AI provider or model, first open the exact YouTube Digest project folder that Chrome loaded through **Load unpacked** in your coding agent. Then open YouTube Digest Settings and use **Copy customization prompt**. Replace the `[PROVIDER]` and `[MODEL]` placeholders before sending it. Do not include any API key in the prompt or chat. After the agent updates your local copy, enter the key yourself in the Settings field it identifies.
+If you want another AI provider or model, first open the exact daweige digest project folder that Chrome loaded through **Load unpacked** in your coding agent. Then open daweige digest Settings and use **Copy customization prompt**. Replace the `[PROVIDER]` and `[MODEL]` placeholders before sending it. Do not include any API key in the prompt or chat. After the agent updates your local copy, enter the key yourself in the Settings field it identifies.
 
 ## Privacy and data flow
 
-YouTube Digest makes provider requests directly from the extension:
+daweige digest makes provider requests directly from the extension:
 
 1. It sends a canonical YouTube watch URL to Supadata to request the native transcript.
 2. It sends the transcript and relevant video metadata to DeepSeek when you request AI features.
 3. Focused features send only the content they need, such as selected text with context or small transcript batches for translation.
 4. It stores keys, settings, notes, and recent cache entries locally in Chrome.
 
-There is no YouTube Digest account system, advertising, analytics, or telemetry. Supadata and DeepSeek still receive data under their own terms and privacy policies. See [PRIVACY.md](PRIVACY.md) for details.
+There is no daweige digest account system, advertising, analytics, or telemetry. Supadata and DeepSeek still receive data under their own terms and privacy policies. See [PRIVACY.md](PRIVACY.md) for details.
 
 ## Troubleshooting
 
 ### The Digest button is missing on a YouTube video
 
-- At `chrome://extensions`, find YouTube Digest and click **Reload**, then refresh the YouTube tab.
+- At `chrome://extensions`, find daweige digest and click **Reload**, then refresh the YouTube tab.
 - Confirm that you are on a standard `https://www.youtube.com/watch?...` page, not a Short, embed, or live page.
 - The current version automatically follows YouTube when its responsive action bar changes. Wait a moment after the page finishes loading.
 - If you have an older downloaded copy, resizing the YouTube window horizontally once may reveal the button. Then download the latest version so resizing is no longer required.
@@ -195,11 +201,11 @@ There is no YouTube Digest account system, advertising, analytics, or telemetry.
 ### The side panel does not open
 
 - Confirm that you are on a standard `https://www.youtube.com/watch?...` page.
-- At `chrome://extensions`, confirm YouTube Digest is enabled and click **Reload**.
+- At `chrome://extensions`, confirm daweige digest is enabled and click **Reload**.
 - Refresh the YouTube tab after reloading the extension.
 - Ask your coding agent to inspect the extension if the problem continues.
 
-### YouTube Digest asks for setup
+### daweige digest asks for setup
 
 - Open **Settings** and save both a Supadata key and a DeepSeek key.
 - This published version uses the fixed DeepSeek V4 Flash endpoint and model. There are no Base URL or Model fields to configure.
@@ -211,7 +217,7 @@ There is no YouTube Digest account system, advertising, analytics, or telemetry.
 - Check your Supadata key, remaining credits, rate limit, and account status.
 - Remember that unavailable native lookups and manual retries may still consume credits.
 
-YouTube Digest will not fall back to generated transcription.
+daweige digest will not fall back to generated transcription.
 
 ### AI requests fail
 

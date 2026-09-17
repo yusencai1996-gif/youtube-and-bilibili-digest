@@ -6,6 +6,7 @@ const vm = require("node:vm");
 
 const root = path.resolve(__dirname, "..");
 const read = (file) => fs.readFileSync(path.join(root, file), "utf8");
+const YTD_UI_I18N = require("../settings.js").UI_I18N;
 
 function loadSearchHelper() {
   const listeners = { addListener() {} };
@@ -48,6 +49,7 @@ function loadSearchHelper() {
       tabs: { onUpdated: listeners, onActivated: listeners },
     },
     YTD_SETTINGS: {},
+    YTD_UI_I18N,
   };
   sandbox.globalThis = sandbox;
   vm.runInNewContext(read("sidepanel.js"), sandbox);

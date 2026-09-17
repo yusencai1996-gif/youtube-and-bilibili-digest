@@ -6,6 +6,7 @@ const vm = require("node:vm");
 
 const root = path.resolve(__dirname, "..");
 const read = (file) => fs.readFileSync(path.join(root, file), "utf8");
+const YTD_UI_I18N = require("../settings.js").UI_I18N;
 
 const BVID = "BV1GJ411x7h7";
 const CID_P1 = "111";
@@ -199,6 +200,7 @@ function createSidepanelHarness({
   const runtimeListeners = [];
   const tabUpdatedListeners = [];
   const tabActivatedListeners = [];
+  const storageChangedListeners = [];
   const timeouts = new Map();
   let nextTimerId = 1;
 
@@ -401,7 +403,15 @@ function createSidepanelHarness({
         },
         sendMessage: dispatchMessage,
       },
-      storage: { local: localArea, session: sessionArea },
+      storage: {
+        local: localArea,
+        session: sessionArea,
+        onChanged: {
+          addListener(listener) {
+            storageChangedListeners.push(listener);
+          },
+        },
+      },
       windows: { getCurrent: async () => ({ id: 7 }) },
       tabs: {
         onUpdated: {
@@ -420,6 +430,7 @@ function createSidepanelHarness({
       },
     },
     YTD_SETTINGS: {},
+    YTD_UI_I18N,
   };
   sandbox.globalThis = sandbox;
 
@@ -474,6 +485,17 @@ function createSidepanelHarness({
       for (const listener of tabActivatedListeners) {
         await listener(activeInfo);
       }
+    },
+    async fireStorageChanged(changes, areaName = "local") {
+      for (const listener of storageChangedListeners) {
+        await listener(changes, areaName);
+      }
+    },
+    async setUiLanguage(language) {
+      await localArea.set({ [YTD_UI_I18N.LANGUAGE_STORAGE_KEY]: language });
+      await this.fireStorageChanged({
+        [YTD_UI_I18N.LANGUAGE_STORAGE_KEY]: { oldValue: undefined, newValue: language },
+      });
     },
     async boot() {
       await documentListeners.DOMContentLoaded();
@@ -539,8 +561,8 @@ test("login-required shows a neutral login prompt, not an error spinner", async 
   await harness.boot();
 
   assert.equal(harness.getEl("errorState").style.display, "block");
-  assert.equal(harness.getEl("errorTitle").textContent, "请先登录 B 站");
-  assert.equal(harness.getEl("errorBtn").textContent, "重试");
+  assert.equal(harness.getEl("errorTitle").textContent, "Log in to Bilibili");
+  assert.equal(harness.getEl("errorBtn").textContent, "Retry");
   assert.equal(harness.getEl("loadingState").style.display, "none");
 });
 
@@ -552,13 +574,14 @@ test("no-subtitle shows a neutral empty state", async () => {
       status: "no-subtitle",
       video: msg.video,
       message: "该视频无字幕",
+      messageEn: "No subtitles available for this video",
       warnings: [],
     }),
   });
   await harness.boot();
 
-  assert.equal(harness.getEl("errorTitle").textContent, "该视频无字幕");
-  assert.equal(harness.getEl("errorBtn").textContent, "重新检查");
+  assert.equal(harness.getEl("errorTitle").textContent, "No subtitles for this video");
+  assert.equal(harness.getEl("errorBtn").textContent, "Check again");
 });
 
 test("RATE_LIMITED shows a cooling hint and never auto-requests", async () => {
@@ -577,14 +600,14 @@ test("RATE_LIMITED shows a cooling hint and never auto-requests", async () => {
   await harness.boot();
 
   const button = harness.getEl("errorBtn");
-  assert.equal(harness.getEl("errorTitle").textContent, "请求暂时受限");
+  assert.equal(harness.getEl("errorTitle").textContent, "Requests temporarily limited");
   assert.equal(button.disabled, true);
   assert.match(button.textContent, /60/);
 
   const fetchesBefore = harness.messagesOf("fetchBilibiliTranscript").length;
   harness.flushTimeouts(); // cooldown expires
   assert.equal(button.disabled, false);
-  assert.equal(button.textContent, "重试");
+  assert.equal(button.textContent, "Retry");
   // Only the button was restored — no automatic refetch.
   assert.equal(
     harness.messagesOf("fetchBilibiliTranscript").length,
@@ -602,7 +625,7 @@ test("network failure keeps the page with a manual retry", async () => {
   });
   await harness.boot();
 
-  assert.equal(harness.getEl("errorTitle").textContent, "字幕获取失败");
+  assert.equal(harness.getEl("errorTitle").textContent, "Failed to fetch subtitles");
   assert.equal(harness.getEl("errorBtn").textContent, "Try Again");
 
   // Manual retry re-runs the bilibili flow for the same locator.
@@ -873,8 +896,8 @@ test("a refresh with changed text invalidates old translations and analysis", as
 
 test("source badge labels cc / ai / conclusion provenance", async () => {
   for (const [source, expected] of [
-    ["cc", "来源：B 站 CC 字幕"],
-    ["ai", "来源：B 站 AI 字幕"],
+    ["cc", "Source: Bilibili CC subtitles"],
+    ["ai", "Source: Bilibili AI subtitles"],
   ]) {
     const harness = createSidepanelHarness({
       fetchImpl: async (msg) => readyResult(msg.video, { source }),
@@ -899,7 +922,7 @@ test("conclusion transcripts disclose the missing foreign original and disable f
 
   const badge = harness.getEl("transcriptSourceBadge");
   const label = badge.children.find((c) => c.className === "transcript-source-label");
-  assert.equal(label.textContent, "来源：B 站转写 · 未提供外文原文");
+  assert.equal(label.textContent, "Source: Bilibili auto-transcription · No foreign-language original");
 
   const zhButton = harness.modeButtons.find((b) => b.dataset.transcriptMode === "zh");
   const bilingualButton = harness.modeButtons.find(
@@ -911,7 +934,7 @@ test("conclusion transcripts disclose the missing foreign original and disable f
   assert.equal(zhButton.disabled, true);
   assert.equal(bilingualButton.disabled, true);
   assert.equal(originalButton.disabled, false);
-  assert.match(zhButton.title, /未提供外文原文/);
+  assert.match(zhButton.title, /no foreign-language original/i);
 });
 
 test("possiblyPartial coverage shows the honest incomplete hint", async () => {
@@ -926,7 +949,7 @@ test("possiblyPartial coverage shows the honest incomplete hint", async () => {
   const badge = harness.getEl("transcriptSourceBadge");
   const hint = badge.children.find((c) => c.className === "transcript-partial-hint");
   assert.ok(hint);
-  assert.match(hint.textContent, /字幕可能尚未完整/);
+  assert.match(hint.textContent, /may be incomplete/);
   // Manual refresh is offered for the current video.
   const refresh = badge.children.find((c) => c.id === "bilibiliRefreshBtn");
   assert.ok(refresh);
@@ -1193,7 +1216,7 @@ test("the source badge survives cycling through all three language modes", async
     const label = badge.children.find(
       (c) => c.className === "transcript-source-label",
     );
-    assert.equal(label.textContent, "来源：B 站 CC 字幕");
+    assert.equal(label.textContent, "Source: Bilibili CC subtitles");
   }
 });
 
@@ -1254,4 +1277,162 @@ test("a partial transcript older than 5 minutes refetches even when its entry wa
   );
   const state = harness.testing.getBilibiliPanelState();
   assert.equal(state.currentTranscriptText, "你好，世界。");
+});
+
+// ------------------------------------------------------------
+// Interface language follows Settings live (storage.onChanged)
+// ------------------------------------------------------------
+
+test("switching the interface language re-renders the visible panel live", async () => {
+  const harness = createSidepanelHarness();
+  await harness.boot();
+
+  const labelOf = () =>
+    harness
+      .getEl("transcriptSourceBadge")
+      .children.find((c) => c.className === "transcript-source-label")
+      .textContent;
+
+  // Default UI language is English.
+  assert.equal(labelOf(), "Source: Bilibili CC subtitles");
+  assert.equal(harness.sandbox.document.documentElement.lang, "en");
+
+  // The user flips Settings to Chinese: storage.onChanged fires once and
+  // every localized surface re-renders without a panel reload.
+  await harness.setUiLanguage("zh-CN");
+  assert.equal(labelOf(), "来源：B 站 CC 字幕");
+  assert.equal(harness.sandbox.document.documentElement.lang, "zh-CN");
+
+  // Flipping back to English restores the English badge.
+  await harness.setUiLanguage("en");
+  assert.equal(labelOf(), "Source: Bilibili CC subtitles");
+});
+
+test("switching the interface language re-renders a visible error live", async () => {
+  const harness = createSidepanelHarness({
+    fetchImpl: async () => ({
+      success: false,
+      requestId: "r",
+      error: {
+        code: "RATE_LIMITED",
+        message: "请求暂时受限，请稍后重试",
+        messageEn: "Requests are temporarily limited, please retry later",
+        retryable: true,
+        retryAfterMs: 60000,
+      },
+    }),
+  });
+  await harness.boot();
+
+  assert.equal(
+    harness.getEl("errorTitle").textContent,
+    "Requests temporarily limited",
+  );
+  assert.match(harness.getEl("errorBtn").textContent, /^Wait \d+s$/);
+
+  await harness.setUiLanguage("zh-CN");
+  assert.equal(harness.getEl("errorTitle").textContent, "请求暂时受限");
+  assert.match(harness.getEl("errorBtn").textContent, /^请等待 \d+ 秒$/);
+  assert.equal(
+    harness.getEl("errorMessage").textContent,
+    "请求暂时受限，请稍后重试",
+  );
+
+  await harness.setUiLanguage("en");
+  assert.equal(
+    harness.getEl("errorTitle").textContent,
+    "Requests temporarily limited",
+  );
+  assert.equal(
+    harness.getEl("errorMessage").textContent,
+    "Requests are temporarily limited, please retry later",
+  );
+});
+
+test("a panel booted in Chinese renders the empty states in Chinese", async () => {
+  const harness = createSidepanelHarness({
+    fetchImpl: async (msg) => ({
+      success: true,
+      requestId: msg.requestId,
+      status: "no-subtitle",
+      video: msg.video,
+      message: "该视频无字幕",
+      messageEn: "No subtitles available for this video",
+      warnings: [],
+    }),
+  });
+  await harness.localArea.set({
+    [YTD_UI_I18N.LANGUAGE_STORAGE_KEY]: "zh-CN",
+  });
+  await harness.boot();
+
+  assert.equal(harness.getEl("errorTitle").textContent, "该视频无字幕");
+  assert.equal(
+    harness.getEl("errorMessage").textContent,
+    "该视频无字幕",
+  );
+  assert.equal(harness.getEl("errorBtn").textContent, "重新检查");
+});
+
+test("empty notes intro follows the interface language, including live switches", async () => {
+  const harness = createSidepanelHarness();
+  await harness.localArea.set({
+    [YTD_UI_I18N.LANGUAGE_STORAGE_KEY]: "zh-CN",
+  });
+  await harness.boot();
+
+  const intro = harness.getEl("notesIntro");
+  // No notes: renderNotes owns the empty-state copy, in Chinese after a
+  // Chinese boot (the static markup no longer carries a data-i18n key that
+  // could overwrite it).
+  assert.equal(intro.style.display, "block");
+  assert.equal(
+    intro.textContent,
+    "这个视频还没有笔记。把鼠标移到视频上并点击 Note 即可保存。",
+  );
+
+  await harness.setUiLanguage("en");
+  assert.equal(
+    intro.textContent,
+    "No notes for this video yet. Hover over the video and click Note to save.",
+  );
+
+  await harness.setUiLanguage("zh-CN");
+  assert.equal(
+    intro.textContent,
+    "这个视频还没有笔记。把鼠标移到视频上并点击 Note 即可保存。",
+  );
+});
+
+test("switching the interface language refreshes the selection toolbar in place", async () => {
+  const harness = createSidepanelHarness();
+  await harness.boot();
+
+  // The toolbar was built once by setupExplainFeature; the refresh must
+  // update its strings WITHOUT replacing the element (a rebuild would drop
+  // the user's current text selection).
+  const tooltip = harness.getEl("explainTooltip");
+  const explainButton = tooltip.querySelector(".explain-btn");
+  const noteButton = tooltip.querySelector(".selection-note-btn");
+
+  await harness.setUiLanguage("zh-CN");
+  assert.equal(
+    tooltip.getAttribute("aria-label"),
+    "选中字幕后可用的操作",
+  );
+  assert.equal(explainButton.textContent, "讲解");
+  assert.equal(noteButton.textContent, "存为笔记");
+  assert.equal(
+    harness.getEl("explainTooltip"),
+    tooltip,
+    "the toolbar element must not be rebuilt on language switch",
+  );
+
+  await harness.setUiLanguage("en");
+  assert.equal(
+    tooltip.getAttribute("aria-label"),
+    "Selected transcript actions",
+  );
+  assert.equal(explainButton.textContent, "Explain");
+  assert.equal(noteButton.textContent, "Note");
 });

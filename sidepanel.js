@@ -11,6 +11,98 @@ const debugLog = (...args) => {
 };
 
 // ============================================================
+// INTERFACE LANGUAGE (shared dictionary from settings.js)
+// ============================================================
+// The whole panel follows the language chosen on the options page. Static
+// markup carries data-i18n* attributes; dynamic strings go through t(key).
+// chrome.storage.onChanged re-applies everything live when the user flips
+// the language in Settings.
+
+const UI = globalThis.YTD_UI_I18N;
+let uiLanguage = "en";
+
+function t(key, params) {
+  return UI.translate(uiLanguage, key, params);
+}
+
+/**
+ * Applies the current UI language to every element carrying data-i18n*
+ * attributes and to the document itself.
+ */
+function applyUiLanguage() {
+  document.documentElement.lang = uiLanguage;
+  for (const element of document.querySelectorAll("[data-i18n]")) {
+    element.textContent = t(element.dataset.i18n);
+  }
+  for (const element of document.querySelectorAll("[data-i18n-aria-label]")) {
+    element.setAttribute("aria-label", t(element.dataset.i18nAriaLabel));
+  }
+  for (const element of document.querySelectorAll("[data-i18n-placeholder]")) {
+    element.setAttribute("placeholder", t(element.dataset.i18nPlaceholder));
+  }
+  for (const element of document.querySelectorAll("[data-i18n-title]")) {
+    element.setAttribute("title", t(element.dataset.i18nTitle));
+  }
+}
+
+/**
+ * Reads the stored language once at startup, applies it, then keeps the panel
+ * in sync with Settings changes through chrome.storage.onChanged.
+ */
+async function initUiLanguage() {
+  uiLanguage = await UI.readUiLanguage(chrome.storage?.local);
+  applyUiLanguage();
+  chrome.storage?.onChanged?.addListener?.((changes, areaName) => {
+    if (areaName !== "local") return;
+    const change = changes?.[UI.LANGUAGE_STORAGE_KEY];
+    if (!change) return;
+    const next = UI.normalizeLanguage(change.newValue);
+    if (next === uiLanguage) return;
+    uiLanguage = next;
+    applyUiLanguage();
+    rerenderLocalizedSurfaces();
+  });
+}
+
+/**
+ * Re-renders the dynamic surfaces whose strings are not covered by static
+ * data-i18n markup: the visible error/loading shells, the Bilibili provenance
+ * badge, the selection toolbar, and the currently rendered
+ * transcript/overview/notes content. renderNotes runs unconditionally: with
+ * an empty list it is responsible for the localized empty-state intro.
+ */
+function rerenderLocalizedSurfaces() {
+  renderStoredLoading();
+  renderStoredError();
+  if (currentTranscript) {
+    if (currentTranscriptMode === "original") {
+      renderTranscript();
+    } else {
+      void translateTranscript();
+    }
+  }
+  if (currentAnalysis) renderAnalysisResults(currentAnalysis);
+  renderNotes(currentNotes, currentNotesFilterVideoId);
+  refreshSelectionToolbarLanguage();
+  syncBilibiliLanguageModeTitles();
+}
+
+/**
+ * Refreshes the selection toolbar's strings in place after a language
+ * switch. The toolbar DOM is deliberately NOT rebuilt: recreating it would
+ * drop the user's current text selection.
+ */
+function refreshSelectionToolbarLanguage() {
+  const tooltip = document.getElementById("explainTooltip");
+  if (!tooltip) return;
+  tooltip.setAttribute("aria-label", t("selectionToolbarAria"));
+  const explainButton = tooltip.querySelector(".explain-btn");
+  if (explainButton) explainButton.textContent = t("explainAction");
+  const noteButton = tooltip.querySelector(".selection-note-btn");
+  if (noteButton) noteButton.textContent = t("noteAction");
+}
+
+// ============================================================
 // STATE
 // ============================================================
 
@@ -103,12 +195,7 @@ function sendTranslationMessage(message) {
     };
 
     timeoutId = setTimeout(() => {
-      finish(
-        reject,
-        new Error(
-          "Translation request timed out after 130 seconds. Please Retry.",
-        ),
-      );
+      finish(reject, new Error(t("translationTimeout")));
     }, TRANSLATION_MESSAGE_TIMEOUT_MS);
 
     let messagePromise;
@@ -285,6 +372,7 @@ function groupTranscriptEntries(entries, limits = TRANSCRIPT_SEGMENT_LIMITS) {
 // ============================================================
 
 document.addEventListener("DOMContentLoaded", async () => {
+  await initUiLanguage();
   setTranscriptModeButtons("original");
   setupEventListeners();
   await evictOldCacheEntries(20);
@@ -797,7 +885,7 @@ async function startBilibiliDigest(locator, tabUrl, { forceRefresh = false } = {
     currentPlatform !== "bilibili";
 
   showState("loading");
-  updateLoading("Fetching transcript", "Resolving Bilibili video...");
+  updateLoadingLocalized("loadingTitle", "loadingResolving");
 
   let resolveResult;
   try {
@@ -809,10 +897,7 @@ async function startBilibiliDigest(locator, tabUrl, { forceRefresh = false } = {
     });
   } catch (error) {
     if (isStale()) return;
-    showError(
-      "Could not reach the page",
-      "Reload the Bilibili tab and try again.",
-    );
+    showLocalizedError("pageUnreachableTitle", "pageUnreachableMessage");
     errorAction = () => checkCurrentTab();
     return;
   }
@@ -924,7 +1009,7 @@ async function startBilibiliDigest(locator, tabUrl, { forceRefresh = false } = {
 
   showBilibiliVideoHeader();
   showState("loading");
-  updateLoading("Fetching transcript", "");
+  updateLoadingLocalized("loadingTitle");
 
   let fetchResult;
   try {
@@ -937,10 +1022,7 @@ async function startBilibiliDigest(locator, tabUrl, { forceRefresh = false } = {
     });
   } catch (error) {
     if (isStale()) return;
-    showError(
-      "Could not reach the page",
-      "Reload the Bilibili tab and try again.",
-    );
+    showLocalizedError("pageUnreachableTitle", "pageUnreachableMessage");
     errorAction = () => checkCurrentTab();
     return;
   }
@@ -969,7 +1051,7 @@ function showBilibiliVideoHeader() {
  */
 function applyBilibiliTranscriptResponse(result, video, retryCtx, previousText = null) {
   if (!result || typeof result !== "object") {
-    showError("No response", "The background worker did not answer.");
+    showLocalizedError("noResponseTitle", "noResponseMessage");
     errorAction = () => checkCurrentTab();
     return;
   }
@@ -981,27 +1063,29 @@ function applyBilibiliTranscriptResponse(result, video, retryCtx, previousText =
 
   if (result.status === "login-required") {
     showBilibiliEmptyState(
-      "请先登录 B 站",
-      result.message || "登录 B 站后即可读取该视频的字幕。",
-      "重试",
+      "biliLoginTitle",
+      "biliLoginMessage",
+      "retry",
       retryCtx,
+      result,
     );
     return;
   }
 
   if (result.status === "no-subtitle") {
     showBilibiliEmptyState(
-      "该视频无字幕",
-      result.message || "这个视频目前没有可用的字幕。",
-      "重新检查",
+      "biliNoSubtitleTitle",
+      "biliNoSubtitleMessage",
+      "recheck",
       retryCtx,
+      result,
     );
     return;
   }
 
   if (result.status !== "ready" || !Array.isArray(result.transcript)) {
     handleBilibiliMessageError(
-      { code: "INVALID_RESPONSE", message: "Unexpected transcript response." },
+      { code: "INVALID_RESPONSE", ...bilingualMessage("unexpectedTranscriptResponse") },
       retryCtx,
     );
     return;
@@ -1038,13 +1122,19 @@ function applyBilibiliTranscriptResponse(result, video, retryCtx, previousText =
 
 /**
  * Neutral empty states (not errors): no subtitles, or login required. Both
- * offer a manual retry and never spin forever.
+ * offer a manual retry and never spin forever. The backend payload may carry
+ * bilingual `message`/`messageEn` text; the dictionary keys are the fallback.
  */
-function showBilibiliEmptyState(title, message, buttonText, retryCtx) {
+function showBilibiliEmptyState(titleKey, messageKey, buttonKey, retryCtx, payload = null) {
   showState("error");
-  document.getElementById("errorTitle").textContent = title;
-  document.getElementById("errorMessage").textContent = message;
-  document.getElementById("errorBtn").textContent = buttonText;
+  currentErrorRender = {
+    titleKey,
+    messageKey,
+    buttonKey,
+    messageText: typeof payload?.message === "string" ? payload.message : "",
+    messageTextEn: typeof payload?.messageEn === "string" ? payload.messageEn : "",
+  };
+  renderStoredError();
   errorAction = () => {
     if (retryCtx?.locator) {
       startBilibiliDigest(retryCtx.locator, retryCtx.tabUrl);
@@ -1055,18 +1145,111 @@ function showBilibiliEmptyState(title, message, buttonText, retryCtx) {
 }
 
 /**
+ * Picks the backend-supplied error text for the current UI language. The
+ * background worker ships zh-CN in `message` and English in `messageEn`.
+ */
+function backendMessage(error) {
+  if (!error || typeof error !== "object") return "";
+  const zh = typeof error.message === "string" ? error.message : "";
+  const en = typeof error.messageEn === "string" ? error.messageEn : "";
+  return uiLanguage === "zh-CN" ? zh || en : en || zh;
+}
+
+/**
+ * Builds a bilingual { message, messageEn } pair from a dictionary key, for
+ * synthetic error payloads created inside the panel itself.
+ */
+function bilingualMessage(key) {
+  return {
+    message: UI.translate("zh-CN", key),
+    messageEn: UI.translate("en", key),
+  };
+}
+
+/**
+ * Maps a fetchTranscript failure to localized text. Known wire codes render
+ * from the dictionary; anything else (network exceptions, provider text)
+ * passes through as-is.
+ */
+function localizeFetchTranscriptError(result) {
+  switch (result?.error) {
+    case "INVALID_SUPADATA_KEY":
+      return t("supadataKeyInvalid");
+    case "NO_TRANSCRIPT":
+      return t("noSubtitlesForVideo");
+    case "RATE_LIMITED":
+      return t("supadataRateLimited");
+    case "EMPTY_TRANSCRIPT":
+      return t("emptyTranscript");
+    default:
+      return result?.message || result?.error || t("errorGenericMessage");
+  }
+}
+
+/**
+ * Maps AI-provider failure codes (analysis, explain, translation) to
+ * localized text. Both the `error` field (which sometimes carries a wire
+ * code) and the explicit `code` field are checked. Returns "" when nothing
+ * matched, so callers can fall back to the provider's raw message.
+ */
+function localizeBackendFailure(result) {
+  for (const candidate of [result?.code, result?.error]) {
+    switch (candidate) {
+      case "NO_AI_KEY":
+        return t("deepseekKeyMissingPrompt");
+      case "INVALID_AI_KEY":
+        return t("deepseekKeyInvalid");
+      case "RATE_LIMITED":
+        return t("deepseekRateLimited");
+      case "AI_IDLE_TIMEOUT":
+        return t("aiIdleTimeout");
+      case "AI_HARD_TIMEOUT":
+        return t("aiHardTimeout");
+      case "EMPTY_AI_RESPONSE":
+        return t("aiEmptyResponse");
+      case "AI_RESPONSE_TOO_LARGE":
+        return t("aiResponseTooLarge");
+      default:
+        break;
+    }
+  }
+  return "";
+}
+
+/**
+ * Failure text for one transcript translation batch: provider codes render
+ * localized, anything else falls back to the raw message or a generic line.
+ */
+function localizeTranslationRowError(result) {
+  return (
+    localizeBackendFailure(result) ||
+    (typeof result?.error === "string" && result.error) ||
+    t("translationFailed")
+  );
+}
+
+/**
+ * The pure alignment helper marks missing translations with a fixed English
+ * sentinel. Map that sentinel (and the batch-level fallback) to the current
+ * interface language at display time.
+ */
+function localizeTranslationRowErrorText(error) {
+  if (error === "Translation unavailable.") return t("translationUnavailable");
+  if (error === "Translation failed.") return t("translationFailed");
+  return error;
+}
+
+/**
  * Maps the frozen error codes to UI behavior: unsupported input is explained
  * without retry, rate limiting shows a cooldown, network problems keep the
  * page alive with a manual retry, and stale contexts hand back to the
- * navigation flow.
+ * navigation flow. Message text resolves at render time, so flipping the
+ * interface language re-renders the visible error in the new language.
  */
 function handleBilibiliMessageError(error, retryCtx = {}) {
   const code =
     typeof error === "string" ? error : error?.code || "NETWORK_ERROR";
-  const message =
-    (typeof error === "object" && typeof error?.message === "string"
-      ? error.message
-      : "") || "Something went wrong.";
+  const fromBackend = () => backendMessage(error) || t("errorGenericMessage");
 
   const retry = () => {
     if (retryCtx?.locator) {
@@ -1087,42 +1270,47 @@ function handleBilibiliMessageError(error, retryCtx = {}) {
       const waitMs = Number.isFinite(error?.retryAfterMs)
         ? Math.max(1000, error.retryAfterMs)
         : 60000;
-      showBilibiliRateLimited(message, waitMs, retry);
+      showBilibiliRateLimited(error, waitMs, retry);
       return;
     }
 
     case "VIDEO_UNAVAILABLE":
-      showError("视频不可访问", message || "视频不可访问或无权限观看。");
+      showLocalizedError("biliVideoUnavailableTitle", null, {
+        resolveMessage: () => backendMessage(error) || t("biliVideoUnavailableMessage"),
+      });
       errorAction = retry;
       return;
 
     case "UNSUPPORTED_PAGE":
     case "INVALID_REQUEST":
     case "PAGE_NOT_FOUND":
-      showError("页面不受支持", message || "这个页面不在支持范围内。");
+      showLocalizedError("biliUnsupportedTitle", null, {
+        resolveMessage: () => backendMessage(error) || t("biliUnsupportedMessage"),
+      });
       errorAction = () => checkCurrentTab();
       return;
 
     case "INVALID_RESPONSE":
     case "SUBTITLE_MISMATCH":
-      showError(
-        "无法安全读取字幕",
-        message || "B 站返回的字幕数据无法验证，未予显示。",
-      );
+      showLocalizedError("biliUnsafeSubtitleTitle", null, {
+        resolveMessage: () => backendMessage(error) || t("biliUnsafeSubtitleMessage"),
+      });
       errorAction = retry;
       return;
 
     case "PLAYER_NOT_READY":
     case "CONTENT_UNAVAILABLE":
     case "TAB_GONE":
-      showError("页面连接已断开", "请刷新当前 B 站页面后重试。");
+      showLocalizedError("biliDisconnectedTitle", "biliDisconnectedMessage");
       errorAction = () => checkCurrentTab();
       return;
 
     case "TRANSCRIPT_NOT_READY":
     case "STORAGE_FAILED":
     case "PANEL_OPEN_FAILED":
-      showError("操作未完成", message);
+      showLocalizedError("biliActionIncompleteTitle", null, {
+        resolveMessage: fromBackend,
+      });
       errorAction = retry;
       return;
 
@@ -1130,7 +1318,9 @@ function handleBilibiliMessageError(error, retryCtx = {}) {
     case "TIMEOUT":
     case "WBI_KEY_UNAVAILABLE":
     default:
-      showError("字幕获取失败", message);
+      showLocalizedError("biliFetchFailedTitle", null, {
+        resolveMessage: fromBackend,
+      });
       errorAction = retry;
       return;
   }
@@ -1140,21 +1330,31 @@ function handleBilibiliMessageError(error, retryCtx = {}) {
  * Rate limiting UI: a cooling hint with a disabled retry button. When the
  * cooldown ends we only re-enable the button — we never auto-request.
  */
-function showBilibiliRateLimited(message, waitMs, retry) {
+function showBilibiliRateLimited(error, waitMs, retry) {
   showState("error");
-  document.getElementById("errorTitle").textContent = "请求暂时受限";
-  document.getElementById("errorMessage").textContent =
-    message || "B 站请求过于频繁，请稍后再试。";
+  currentErrorRender = {
+    titleKey: "biliRateLimitedTitle",
+    messageKey: "biliRateLimitedMessage",
+    resolveMessage: () => backendMessage(error) || t("biliRateLimitedMessage"),
+    rateLimitDeadline: Date.now() + waitMs,
+  };
+  renderStoredError();
   const button = document.getElementById("errorBtn");
   button.disabled = true;
-  button.textContent = `请等待 ${Math.ceil(waitMs / 1000)} 秒`;
   errorAction = retry;
 
   if (rateLimitCooldownTimer) clearTimeout(rateLimitCooldownTimer);
   rateLimitCooldownTimer = setTimeout(() => {
     rateLimitCooldownTimer = null;
     button.disabled = false;
-    button.textContent = "重试";
+    if (currentErrorRender?.rateLimitDeadline) {
+      currentErrorRender = {
+        ...currentErrorRender,
+        rateLimitDeadline: null,
+        buttonKey: "retry",
+      };
+    }
+    button.textContent = t("retry");
   }, waitMs);
 }
 
@@ -1178,14 +1378,14 @@ function invalidateBilibiliDerivedCaches(videoKey) {
 }
 
 function bilibiliSourceLabel(source, originalAvailable) {
-  if (source === "cc") return "来源：B 站 CC 字幕";
-  if (source === "ai") return "来源：B 站 AI 字幕";
+  if (source === "cc") return t("sourceCc");
+  if (source === "ai") return t("sourceAi");
   if (source === "conclusion") {
     return originalAvailable
-      ? "来源：B 站转写"
-      : "来源：B 站转写 · 未提供外文原文";
+      ? t("sourceConclusion")
+      : t("sourceConclusionNoOriginal");
   }
-  return "来源：B 站字幕";
+  return t("sourceGeneric");
 }
 
 /**
@@ -1218,7 +1418,7 @@ function renderTranscriptSourceBadge() {
   if (currentCoverage?.possiblyPartial) {
     const hint = document.createElement("span");
     hint.className = "transcript-partial-hint";
-    hint.textContent = "字幕可能尚未完整，已加载现有部分。";
+    hint.textContent = t("partialHint");
     badge.appendChild(hint);
   }
 
@@ -1226,7 +1426,7 @@ function renderTranscriptSourceBadge() {
   refresh.type = "button";
   refresh.id = "bilibiliRefreshBtn";
   refresh.className = "bilibili-refresh-btn";
-  refresh.textContent = "刷新字幕";
+  refresh.textContent = t("refreshSubtitles");
   refresh.addEventListener("click", () => {
     if (currentBilibiliLocator) {
       startBilibiliDigest(currentBilibiliLocator, currentVideoUrl, {
@@ -1237,6 +1437,23 @@ function renderTranscriptSourceBadge() {
   badge.appendChild(refresh);
 
   host.insertBefore(badge, transcriptList);
+}
+
+/**
+ * Applies the disabled-state tooltips for the current UI language. Split from
+ * syncBilibiliLanguageModes so a language switch can refresh titles without
+ * re-running the whole mode sync.
+ */
+function syncBilibiliLanguageModeTitles() {
+  const foreignOriginal = currentOriginalAvailable !== false;
+  document.querySelectorAll(".transcript-mode-btn").forEach((button) => {
+    const disable = !foreignOriginal && button.dataset.transcriptMode !== "original";
+    if (disable) {
+      button.title = t("noOriginalTitle");
+    } else if (!button.disabled) {
+      button.title = "";
+    }
+  });
 }
 
 /**
@@ -1251,7 +1468,7 @@ function syncBilibiliLanguageModes() {
     const disable = !foreignOriginal && button.dataset.transcriptMode !== "original";
     button.disabled = disable;
     if (disable) {
-      button.title = "B 站转写未提供外文原文，无法进行双语对照";
+      button.title = t("noOriginalTitle");
       button.setAttribute("aria-disabled", "true");
     } else {
       button.title = "";
@@ -1323,7 +1540,7 @@ async function saveBilibiliNoteRequest({ timestamp, selectedText }) {
   if (!currentBilibiliVideo || !bilibiliTabId) {
     return {
       success: false,
-      error: { code: "TAB_GONE", message: "No Bilibili tab is connected." },
+      error: { code: "TAB_GONE", ...bilingualMessage("biliTabMissing") },
     };
   }
   const message = {
@@ -1456,7 +1673,7 @@ async function startDigest(videoId, videoUrl) {
   }
 
   showState("loading");
-  updateLoading("Fetching transcript", "");
+  updateLoadingLocalized("loadingTitle");
 
   const transcriptResult = await chrome.runtime.sendMessage({
     action: "fetchTranscript",
@@ -1469,16 +1686,12 @@ async function startDigest(videoId, videoUrl) {
 
   if (!transcriptResult.success) {
     if (transcriptResult.error === "NO_SUPADATA_KEY") {
-      showError(
-        "API key missing",
-        "Add your Supadata API key in YouTube Digest Settings.",
-      );
+      showLocalizedError("apiKeyMissing", "addSupadataKeyPrompt");
       return;
     }
-    showError(
-      "No transcript found",
-      transcriptResult.message || transcriptResult.error,
-    );
+    showLocalizedError("noTranscriptFound", null, {
+      resolveMessage: () => localizeFetchTranscriptError(transcriptResult),
+    });
     return;
   }
 
@@ -1532,8 +1745,8 @@ function renderLocalizedContent(text, surface, id) {
   const translation = translated
     ? escapeHtml(translated)
     : interfaceTranslationFailures.has(cacheKey)
-      ? '<span class="translation-error">Translation unavailable.</span>'
-      : '<span class="translation-pending">Translating...</span>';
+      ? `<span class="translation-error">${t("translationUnavailable")}</span>`
+      : `<span class="translation-pending">${t("translating")}</span>`;
   if (currentTranscriptMode === "bilingual") {
     return `<span class="localized-copy"><span class="localized-original">${escapeHtml(original)}</span><span class="localized-translation">${translation}</span></span>`;
   }
@@ -1730,8 +1943,8 @@ function renderAnalysisResults(analysis) {
       <div class="quote-meta">
         <span class="quote-timestamp">${escapeHtml(quote.timestamp)}</span>
         <div class="quote-actions">
-          <button class="quote-save-note-btn" title="Save this quote as a note">Note</button>
-          <button class="quote-copy-btn" title="Copy this quote">Copy</button>
+          <button class="quote-save-note-btn" title="${t("quoteNoteTitle")}">${t("noteAction")}</button>
+          <button class="quote-copy-btn" title="${t("quoteCopyTitle")}">${t("copyButton")}</button>
         </div>
       </div>
     `;
@@ -1751,9 +1964,9 @@ function renderAnalysisResults(analysis) {
         await navigator.clipboard.writeText(
           getLocalizedPlainText(quote.quote, "overview", `quote-${index}`),
         );
-        quoteCopyBtn.textContent = "Copied";
+        quoteCopyBtn.textContent = t("copied");
         setTimeout(() => {
-          quoteCopyBtn.textContent = "Copy";
+          quoteCopyBtn.textContent = t("copyButton");
         }, 1500);
       } catch (err) {
         console.error("Copy failed:", err);
@@ -1784,7 +1997,7 @@ async function saveQuoteAsNote(quote, btn) {
   if (!currentVideoId) return;
 
   const originalText = btn.textContent;
-  btn.textContent = "Saving...";
+  btn.textContent = t("saving");
   btn.disabled = true;
 
   try {
@@ -1800,7 +2013,7 @@ async function saveQuoteAsNote(quote, btn) {
           });
 
     if (result.success) {
-      btn.textContent = "Saved";
+      btn.textContent = t("saved");
       setTimeout(() => {
         btn.textContent = originalText;
         btn.disabled = false;
@@ -1809,7 +2022,7 @@ async function saveQuoteAsNote(quote, btn) {
       loadNotes(currentVideoId);
     } else {
       console.error("[YouTube Digest] Save quote as note failed:", result.error);
-      btn.textContent = "Error";
+      btn.textContent = t("actionError");
       setTimeout(() => {
         btn.textContent = originalText;
         btn.disabled = false;
@@ -1817,7 +2030,7 @@ async function saveQuoteAsNote(quote, btn) {
     }
   } catch (error) {
     console.error("[YouTube Digest] Save quote as note error:", error);
-    btn.textContent = "Error";
+    btn.textContent = t("actionError");
     setTimeout(() => {
       btn.textContent = originalText;
       btn.disabled = false;
@@ -1999,8 +2212,11 @@ function updateTranscriptSearchControls(query) {
     count.textContent = !query
       ? ""
       : hasMatches
-        ? `${transcriptSearchIndex + 1} of ${transcriptSearchMatches.length}`
-        : "No matches";
+        ? t("searchCount", {
+            index: transcriptSearchIndex + 1,
+            total: transcriptSearchMatches.length,
+          })
+        : t("noMatches");
   }
   if (previous) previous.disabled = !hasMatches;
   if (next) next.disabled = !hasMatches;
@@ -2180,7 +2396,7 @@ function exportTranscript() {
 
   exportText += `TRANSCRIPT:\n\n${transcriptContent}\n`;
   exportText += `\n${"—".repeat(60)}\n`;
-  exportText += `Exported by YouTube Digest\n`;
+  exportText += `${t("exportedBy")}\n`;
 
   const filename = `${sanitizeFilename(currentVideoTitle)}-transcript.txt`;
   downloadTextFile(exportText, filename);
@@ -2216,30 +2432,120 @@ function showState(state) {
   }
 }
 
+// The visible loading/error shells remember how they were produced, so a
+// language switch can re-render them in the new language without replaying
+// the flow that created them.
+let currentLoadingRender = null;
+let currentErrorRender = null;
+
+function renderStoredLoading() {
+  if (!currentLoadingRender) return;
+  const loadingState = document.getElementById("loadingState");
+  if (!loadingState || loadingState.style.display === "none") return;
+  const d = currentLoadingRender;
+  document.getElementById("loadingText").textContent = d.titleKey
+    ? t(d.titleKey)
+    : d.titleText || "";
+  document.getElementById("loadingSubtext").textContent = d.subtitleKey
+    ? t(d.subtitleKey)
+    : d.subtitleText || "";
+}
+
 function updateLoading(title, subtitle) {
-  document.getElementById("loadingText").textContent = title;
-  document.getElementById("loadingSubtext").textContent = subtitle;
+  currentLoadingRender = { titleText: title, subtitleText: subtitle };
+  renderStoredLoading();
+}
+
+function updateLoadingLocalized(titleKey, subtitleKey = null) {
+  currentLoadingRender = { titleKey, subtitleKey };
+  renderStoredLoading();
+}
+
+function renderStoredError() {
+  if (!currentErrorRender) return;
+  const errorState = document.getElementById("errorState");
+  if (!errorState || errorState.style.display === "none") return;
+  const d = currentErrorRender;
+  document.getElementById("errorTitle").textContent = d.titleKey
+    ? t(d.titleKey)
+    : d.titleText || "";
+
+  let message = "";
+  if (typeof d.resolveMessage === "function") {
+    message = d.resolveMessage() || "";
+  }
+  if (!message && (d.messageText || d.messageTextEn)) {
+    message =
+      uiLanguage === "zh-CN"
+        ? d.messageText || d.messageTextEn || ""
+        : d.messageTextEn || d.messageText || "";
+  }
+  if (!message && d.messageKey) {
+    const params =
+      typeof d.messageParams === "function" ? d.messageParams() : d.messageParams;
+    message = t(d.messageKey, params);
+  }
+  document.getElementById("errorMessage").textContent = message;
+
+  const button = document.getElementById("errorBtn");
+  if (d.rateLimitDeadline) {
+    const seconds = Math.max(
+      1,
+      Math.ceil((d.rateLimitDeadline - Date.now()) / 1000),
+    );
+    button.textContent = t("rateLimitWait", { seconds });
+  } else {
+    button.textContent = d.buttonKey
+      ? t(d.buttonKey)
+      : d.buttonText || t("tryAgain");
+  }
 }
 
 function showError(title, message) {
   errorAction = null;
+  currentErrorRender = {
+    titleText: title,
+    messageText: message,
+    buttonKey: "tryAgain",
+  };
   showState("error");
-  document.getElementById("errorTitle").textContent = title;
-  document.getElementById("errorMessage").textContent = message;
-  document.getElementById("errorBtn").textContent = "Try Again";
+  renderStoredError();
+}
+
+function showLocalizedError(titleKey, messageKey, options = {}) {
+  errorAction = null;
+  currentErrorRender = {
+    titleKey,
+    messageKey,
+    buttonKey: "tryAgain",
+    ...options,
+  };
+  showState("error");
+  renderStoredError();
 }
 
 function showConfigError(configStatus) {
-  const missingKeys = [];
-  if (!configStatus.hasSupadataKey) missingKeys.push("Supadata");
-  if (!configStatus.hasAiKey) missingKeys.push("AI provider");
-
-  showState("error");
-  document.getElementById("errorTitle").textContent = "API Keys Missing";
-  document.getElementById("errorMessage").textContent =
-    `Add your ${missingKeys.join(" and ")} API key${missingKeys.length === 1 ? "" : "s"} in YouTube Digest Settings.`;
-  document.getElementById("errorBtn").textContent = "Open Settings";
+  const missing = {
+    supadata: !configStatus.hasSupadataKey,
+    ai: !configStatus.hasAiKey,
+  };
   errorAction = () => chrome.runtime.sendMessage({ action: "openOptions" });
+  currentErrorRender = {
+    titleKey: "configErrorTitle",
+    messageKey: "configErrorMessage",
+    messageParams: () => {
+      const names = [];
+      if (missing.supadata) names.push("Supadata");
+      if (missing.ai) names.push(t("aiProviderName"));
+      return {
+        keys: names.join(uiLanguage === "zh-CN" ? " 和 " : " and "),
+        plural: names.length > 1,
+      };
+    },
+    buttonKey: "openSettings",
+  };
+  showState("error");
+  renderStoredError();
 }
 
 // ============================================================
@@ -2329,7 +2635,7 @@ async function triggerAnalysis() {
     const chapterListEl = document.getElementById("chapterList");
     if (chapterListEl)
       chapterListEl.innerHTML =
-        '<li class="chapter-item" style="color: var(--accent); border: none;">Add your DeepSeek API key in YouTube Digest Settings to use AI features.</li>';
+        `<li class="chapter-item" style="color: var(--accent); border: none;">${t("addDeepseekKeyPrompt")}</li>`;
     return;
   }
   if (!panelAsyncContextCurrent(ctx)) return;
@@ -2342,10 +2648,10 @@ async function triggerAnalysis() {
 
   if (chapterList)
     chapterList.innerHTML =
-      '<li class="chapter-item" style="color: var(--text-muted); border: none;">Loading chapters...</li>';
+      `<li class="chapter-item" style="color: var(--text-muted); border: none;">${t("loadingChapters")}</li>`;
   if (quotesList)
     quotesList.innerHTML =
-      '<div class="quote-item" style="color: var(--text-muted); border-left-color: var(--border);">Loading quotes...</div>';
+      `<div class="quote-item" style="color: var(--text-muted); border-left-color: var(--border);">${t("loadingQuotes")}</div>`;
 
   try {
     const analysisResult = await chrome.runtime.sendMessage({
@@ -2363,8 +2669,12 @@ async function triggerAnalysis() {
     if (!panelAsyncContextCurrent(ctx)) return;
 
     if (!analysisResult.success) {
+      const failureText =
+        localizeBackendFailure(analysisResult) ||
+        analysisResult.error ||
+        t("unknownError");
       if (chapterList)
-        chapterList.innerHTML = `<li class="chapter-item" style="color: var(--accent); border: none;">Analysis failed: ${escapeHtml(analysisResult.error || "Unknown error")}</li>`;
+        chapterList.innerHTML = `<li class="chapter-item" style="color: var(--accent); border: none;">${t("analysisFailed", { error: escapeHtml(failureText) })}</li>`;
       isAnalysisLoading = false;
       return;
     }
@@ -2380,7 +2690,7 @@ async function triggerAnalysis() {
     if (!panelAsyncContextCurrent(ctx)) return;
     console.error("[YouTube Digest Panel] Analysis error:", error);
     if (chapterList)
-      chapterList.innerHTML = `<li class="chapter-item" style="color: var(--accent); border: none;">Error: ${escapeHtml(error.message)}</li>`;
+      chapterList.innerHTML = `<li class="chapter-item" style="color: var(--accent); border: none;">${t("errorPrefix", { message: escapeHtml(error.message) })}</li>`;
   }
 
   isAnalysisLoading = false;
@@ -2506,7 +2816,7 @@ async function copyToClipboardWithFeedback(text, buttonId) {
 
   const success = await copyToClipboard(text);
   if (success) {
-    btn.textContent = "Copied";
+    btn.textContent = t("copied");
     setTimeout(() => {
       btn.textContent = original;
     }, 2000);
@@ -2568,10 +2878,10 @@ function setupExplainFeature() {
   tooltip.id = "explainTooltip";
   tooltip.className = "explain-tooltip";
   tooltip.setAttribute("role", "toolbar");
-  tooltip.setAttribute("aria-label", "Selected transcript actions");
+  tooltip.setAttribute("aria-label", t("selectionToolbarAria"));
   tooltip.innerHTML = `
-    <button class="explain-btn" type="button">Explain</button>
-    <button class="selection-note-btn" type="button">Note</button>
+    <button class="explain-btn" type="button">${t("explainAction")}</button>
+    <button class="selection-note-btn" type="button">${t("noteAction")}</button>
   `;
   tooltip.style.display = "none";
   document.body.appendChild(tooltip);
@@ -2667,7 +2977,7 @@ function setupExplainFeature() {
 
       const button = event.currentTarget;
       const originalText = button.textContent;
-      button.textContent = "Saving...";
+      button.textContent = t("saving");
       button.disabled = true;
 
       try {
@@ -2687,10 +2997,14 @@ function setupExplainFeature() {
               });
 
         if (!result?.success) {
-          throw new Error(result?.error || "Could not save note");
+          throw new Error(
+            backendMessage(result?.error) ||
+              (typeof result?.error === "string" ? result.error : "") ||
+              t("couldNotSaveNote"),
+          );
         }
 
-        button.textContent = "Saved";
+        button.textContent = t("saved");
         loadNotes(currentVideoId);
         setTimeout(() => {
           tooltip.style.display = "none";
@@ -2699,7 +3013,7 @@ function setupExplainFeature() {
         }, 900);
       } catch (error) {
         console.error("[YouTube Digest] Save selected note error:", error);
-        button.textContent = "Error";
+        button.textContent = t("actionError");
         setTimeout(() => {
           button.textContent = originalText;
           button.disabled = false;
@@ -2724,14 +3038,14 @@ async function showExplanation(selectedText) {
   modal.innerHTML = `
     <div class="explain-modal">
       <div class="explain-modal-header">
-        <div class="explain-modal-title">Explain</div>
-        <button class="explain-modal-close" id="closeExplain">Close</button>
+        <div class="explain-modal-title">${t("explainAction")}</div>
+        <button class="explain-modal-close" id="closeExplain">${t("closeAction")}</button>
       </div>
       <div class="explain-selected-text">"${escapeHtml(selectedText.substring(0, 200))}${selectedText.length > 200 ? "..." : ""}"</div>
       <div class="explain-modal-content" id="explanationContent">
         <div class="explain-loading">
           <div class="loading-bar"></div>
-          <span>Analyzing...</span>
+          <span>${t("analyzing")}</span>
         </div>
       </div>
     </div>
@@ -2758,7 +3072,7 @@ async function showExplanation(selectedText) {
     }
     const contentDiv = document.getElementById("explanationContent");
     if (contentDiv) {
-      contentDiv.innerHTML = `<div class="explain-error">Add your DeepSeek API key in YouTube Digest Settings to use AI features.</div>`;
+      contentDiv.innerHTML = `<div class="explain-error">${t("addDeepseekKeyPrompt")}</div>`;
     }
     return;
   }
@@ -2782,7 +3096,9 @@ async function showExplanation(selectedText) {
     if (result.success) {
       contentDiv.innerHTML = `<div class="explain-text">${escapeHtml(result.explanation).replace(/\n\n/g, "</p><p>").replace(/\n/g, "<br>")}</div>`;
     } else {
-      contentDiv.innerHTML = `<div class="explain-error">Failed to get explanation: ${escapeHtml(result.error)}</div>`;
+      const failureText =
+        localizeBackendFailure(result) || result.error || t("unknownError");
+      contentDiv.innerHTML = `<div class="explain-error">${t("explainFailed", { error: escapeHtml(failureText) })}</div>`;
     }
   } catch (error) {
     if (!panelAsyncContextCurrent(ctx)) {
@@ -2790,7 +3106,7 @@ async function showExplanation(selectedText) {
       return;
     }
     const contentDiv = document.getElementById("explanationContent");
-    contentDiv.innerHTML = `<div class="explain-error">Error: ${escapeHtml(error.message)}</div>`;
+    contentDiv.innerHTML = `<div class="explain-error">${t("errorPrefix", { message: escapeHtml(error.message) })}</div>`;
   }
 }
 
@@ -2982,7 +3298,10 @@ async function loadNotes(videoId) {
 }
 
 /**
- * Renders the notes list in the Notes tab.
+ * Renders the notes list in the Notes tab. This function is the single owner
+ * of #notesIntro copy: the empty branch shows the localized empty state,
+ * the non-empty branch hides the intro but still refreshes its text so the
+ * element never carries a stale-language string.
  */
 function renderNotes(notes, filteredVideoId) {
   const notesList = document.getElementById("notesList");
@@ -2995,11 +3314,12 @@ function renderNotes(notes, filteredVideoId) {
   if (!notes || notes.length === 0) {
     notesIntro.style.display = "block";
     notesIntro.textContent = filteredVideoId
-      ? "No notes for this video yet. Hover over the video and click Note to save."
-      : "No notes saved yet. Hover over a video and click Note to save.";
+      ? t("notesEmptyThis")
+      : t("notesEmptyAll");
     return;
   }
 
+  notesIntro.textContent = t("notesIntro");
   notesIntro.style.display = "none";
 
   notes.forEach((note, index) => {
@@ -3013,10 +3333,10 @@ function renderNotes(notes, filteredVideoId) {
       </div>
       <div class="note-text">${renderLocalizedContent(note.text, "notes", translationId)}</div>
       <div class="note-actions">
-        <button class="note-action-btn note-copy-text">Copy text</button>
-        <button class="note-action-btn note-copy-link" data-url="${escapeHtml(note.timestampedUrl)}">Copy timestamp</button>
-        <button class="note-action-btn note-play" data-seconds="${Number(note.timestampSeconds) || 0}">Play</button>
-        <button class="note-delete" data-id="${escapeHtml(note.id)}" type="button" aria-label="Delete note" title="Delete note">
+        <button class="note-action-btn note-copy-text">${t("copyText")}</button>
+        <button class="note-action-btn note-copy-link" data-url="${escapeHtml(note.timestampedUrl)}">${t("copyTimestamp")}</button>
+        <button class="note-action-btn note-play" data-seconds="${Number(note.timestampSeconds) || 0}">${t("playAction")}</button>
+        <button class="note-delete" data-id="${escapeHtml(note.id)}" type="button" aria-label="${t("deleteNote")}" title="${t("deleteNote")}">
           <svg viewBox="0 0 24 24" aria-hidden="true">
             <path d="M3 6h18"></path>
             <path d="M8 6V4h8v2"></path>
@@ -3051,9 +3371,9 @@ function renderNotes(notes, filteredVideoId) {
             getLocalizedPlainText(note.text, "notes", translationId),
           );
           const btn = noteEl.querySelector(".note-copy-text");
-          btn.textContent = "Copied";
+          btn.textContent = t("copied");
           setTimeout(() => {
-            btn.textContent = "Copy text";
+            btn.textContent = t("copyText");
           }, 2000);
         } catch (err) {
           console.error("Copy failed:", err);
@@ -3067,9 +3387,9 @@ function renderNotes(notes, filteredVideoId) {
         try {
           await navigator.clipboard.writeText(note.timestampedUrl);
           const btn = noteEl.querySelector(".note-copy-link");
-          btn.textContent = "Copied";
+          btn.textContent = t("copied");
           setTimeout(() => {
-            btn.textContent = "Copy timestamp";
+            btn.textContent = t("copyTimestamp");
           }, 2000);
         } catch (err) {
           console.error("Copy failed:", err);
@@ -3508,9 +3828,9 @@ function renderTranscriptSegmentContent(segment, mode, translated, error) {
   if (translated) {
     translationHtml = renderSubtitleInlineMarkup(translated);
   } else if (error) {
-    translationHtml = `${escapeHtml(error)}<button class="translation-retry-btn" type="button">Retry</button>`;
+    translationHtml = `${escapeHtml(error)}<button class="translation-retry-btn" type="button">${t("retry")}</button>`;
   } else {
-    translationHtml = "Waiting for translation…";
+    translationHtml = t("waitingForTranslation");
   }
 
   if (mode === "bilingual") {
@@ -3606,7 +3926,7 @@ function updateTranslatedRow(segment, index, alignedItem, generation) {
       segment,
       currentTranscriptMode,
       alignedItem.text,
-      alignedItem.error,
+      alignedItem.error ? localizeTranslationRowErrorText(alignedItem.error) : "",
     );
   }
   row.classList.toggle("translated", !!alignedItem.text);
@@ -3663,7 +3983,7 @@ async function requestTranscriptTranslationBatch(
     const aligned = alignTranslatedSegmentBatch(sourceBatch, responseSegments);
     aligned.forEach((item, batchIndex) => {
       if (!result?.success) {
-        item.error = result?.error || "Translation failed.";
+        item.error = localizeTranslationRowError(result);
       }
       updateTranslatedRow(
         sourceBatch[batchIndex],
@@ -3680,7 +4000,7 @@ async function requestTranscriptTranslationBatch(
       updateTranslatedRow(
         segment,
         indices[batchIndex],
-        { id: segment.id, text: "", error: error.message || "Translation failed." },
+        { id: segment.id, text: "", error: error.message || t("translationFailed") },
         generation,
       );
     });
@@ -3701,7 +4021,7 @@ function retryTranslationSegment(index, generation) {
     const translation = row.querySelector(".transcript-translation");
     if (translation) {
       translation.className = "transcript-translation translation-pending";
-      translation.textContent = "Retrying…";
+      translation.textContent = t("retrying");
     }
   }
   activeTranslationQueue.enqueue(index, true);

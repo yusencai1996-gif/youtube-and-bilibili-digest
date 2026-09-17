@@ -81,7 +81,7 @@ async function requestAiCompletion({
   const settings = await getSettings();
   if (!settings.aiApiKey) {
     const error = new Error(
-      "DeepSeek API key not configured. Open YouTube Digest Settings.",
+      "DeepSeek API key not configured. Open daweige digest Settings.",
     );
     error.code = "NO_AI_KEY";
     throw error;
@@ -662,7 +662,7 @@ async function handleFetchTranscript(videoId) {
       return {
         success: false,
         error: "NO_SUPADATA_KEY",
-        message: "Supadata API key not configured. Open YouTube Digest Settings.",
+        message: "Supadata API key not configured. Open daweige digest Settings.",
       };
     }
 
@@ -706,7 +706,7 @@ async function handleFetchTranscript(videoId) {
         return {
           success: false,
           error: "INVALID_SUPADATA_KEY",
-          message: "Your Supadata API key is invalid. Open YouTube Digest Settings.",
+          message: "Your Supadata API key is invalid. Open daweige digest Settings.",
         };
       }
       if (response.status === 404) {
@@ -937,7 +937,7 @@ async function handleAnalyzeTranscript(
       return {
         success: false,
         error: "NO_AI_KEY",
-        message: "DeepSeek API key not configured. Open YouTube Digest Settings.",
+        message: "DeepSeek API key not configured. Open daweige digest Settings.",
       };
     }
 
@@ -1031,6 +1031,7 @@ async function handleAnalyzeTranscript(
     return {
       success: false,
       error: error.message || "Failed to analyze transcript",
+      code: error.code || null,
     };
   }
 }
@@ -1507,6 +1508,7 @@ async function handleExplainSelection(
     return {
       success: false,
       error: error.message || "Failed to explain selection",
+      code: error.code || null,
     };
   }
 }
@@ -1637,7 +1639,7 @@ async function handleTranslateContent(
 
     const settings = await getSettings();
     if (!settings.aiApiKey) {
-      return { success: false, error: "DeepSeek API key not configured" };
+      return { success: false, error: "NO_AI_KEY" };
     }
 
     const sourceSegments = validateTranscriptBatchRequest(content);
@@ -1689,7 +1691,11 @@ async function handleTranslateContent(
     return { success: true, translatedContent: aligned };
   } catch (error) {
     console.error("[YouTube Digest] Translation error:", error);
-    return { success: false, error: error.message || "Translation failed" };
+    return {
+      success: false,
+      error: error.message || "Translation failed",
+      code: error.code || null,
+    };
   }
 }
 
@@ -1757,19 +1763,33 @@ let bilibiliLastStart = -Infinity;
 let bilibiliCooldownUntil = 0;
 let bilibiliNav = null;
 let bilibiliNoteQueue = Promise.resolve();
+// Bilibili error text ships in both interface languages. The side panel picks
+// `message` or `messageEn` from the wire payload based on the current UI
+// language, so the worker itself never reads the language setting.
 const BILIBILI_ERRORS = {
-  INVALID_REQUEST: "请求参数无效", UNSUPPORTED_PAGE: "不支持此页面",
-  STALE_CONTEXT: "视频页面已切换", VIDEO_UNAVAILABLE: "视频不可访问或无权限",
-  PAGE_NOT_FOUND: "视频分 P 不存在", RATE_LIMITED: "请求暂时受限，请稍后重试",
-  NETWORK_ERROR: "网络请求失败，请重试", TIMEOUT: "请求超时，请重试",
-  WBI_KEY_UNAVAILABLE: "签名信息暂不可用", INVALID_RESPONSE: "无法安全读取响应",
-  SUBTITLE_MISMATCH: "无法确认字幕属于当前视频", TAB_GONE: "标签页已关闭",
-  CONTENT_UNAVAILABLE: "页面脚本不可用，请刷新页面", PLAYER_NOT_READY: "播放器尚未就绪",
-  TRANSCRIPT_NOT_READY: "当前分 P 尚无可用字幕", STORAGE_FAILED: "本地存储失败",
-  PANEL_OPEN_FAILED: "侧边栏打开失败",
+  INVALID_REQUEST: { "zh-CN": "请求参数无效", en: "Invalid request parameters" },
+  UNSUPPORTED_PAGE: { "zh-CN": "不支持此页面", en: "This page is not supported" },
+  STALE_CONTEXT: { "zh-CN": "视频页面已切换", en: "The video page has changed" },
+  VIDEO_UNAVAILABLE: { "zh-CN": "视频不可访问或无权限", en: "Video unavailable or no permission" },
+  PAGE_NOT_FOUND: { "zh-CN": "视频分 P 不存在", en: "Video part not found" },
+  RATE_LIMITED: { "zh-CN": "请求暂时受限，请稍后重试", en: "Requests temporarily limited; please retry later" },
+  NETWORK_ERROR: { "zh-CN": "网络请求失败，请重试", en: "Network request failed; please retry" },
+  TIMEOUT: { "zh-CN": "请求超时，请重试", en: "Request timed out; please retry" },
+  WBI_KEY_UNAVAILABLE: { "zh-CN": "签名信息暂不可用", en: "Signature data temporarily unavailable" },
+  INVALID_RESPONSE: { "zh-CN": "无法安全读取响应", en: "Could not safely read the response" },
+  SUBTITLE_MISMATCH: { "zh-CN": "无法确认字幕属于当前视频", en: "Could not confirm the subtitles belong to this video" },
+  TAB_GONE: { "zh-CN": "标签页已关闭", en: "The tab was closed" },
+  CONTENT_UNAVAILABLE: { "zh-CN": "页面脚本不可用，请刷新页面", en: "Page script unavailable; please refresh the page" },
+  PLAYER_NOT_READY: { "zh-CN": "播放器尚未就绪", en: "Player not ready" },
+  TRANSCRIPT_NOT_READY: { "zh-CN": "当前分 P 尚无可用字幕", en: "No subtitles available for this part yet" },
+  STORAGE_FAILED: { "zh-CN": "本地存储失败", en: "Local storage failed" },
+  PANEL_OPEN_FAILED: { "zh-CN": "侧边栏打开失败", en: "Could not open the side panel" },
 };
+function bilibiliErrorText(code) {
+  return (BILIBILI_ERRORS[code] || BILIBILI_ERRORS.INVALID_RESPONSE)["zh-CN"];
+}
 function bilibiliError(code, extra = {}) {
-  return Object.assign(new Error(BILIBILI_ERRORS[code] || BILIBILI_ERRORS.INVALID_RESPONSE), {
+  return Object.assign(new Error(bilibiliErrorText(code)), {
     code, retryable: ["RATE_LIMITED", "NETWORK_ERROR", "TIMEOUT", "WBI_KEY_UNAVAILABLE",
       "PLAYER_NOT_READY", "CONTENT_UNAVAILABLE", "STORAGE_FAILED", "PANEL_OPEN_FAILED"].includes(code), ...extra,
   });
@@ -1777,7 +1797,8 @@ function bilibiliError(code, extra = {}) {
 function bilibiliFailure(requestId, error) {
   const safe = BILIBILI_ERRORS[error?.code] ? error : bilibiliError("INVALID_RESPONSE");
   return { success: false, requestId, error: {
-    code: safe.code, message: BILIBILI_ERRORS[safe.code], retryable: !!safe.retryable,
+    code: safe.code, message: bilibiliErrorText(safe.code),
+    messageEn: BILIBILI_ERRORS[safe.code].en, retryable: !!safe.retryable,
     ...(safe.code === "RATE_LIMITED" ? { retryAfterMs: Math.max(0, safe.retryAfterMs || 60000) } : {}),
   } };
 }
@@ -2168,7 +2189,9 @@ async function fetchBilibiliTranscript(tabId, supplied, task) {
   // An empty/failed refresh must not leave an old transcript usable for notes.
   bilibiliBodies.set(video.videoKey, { transcript: [], at: Date.now() });
   let pending = false;
-  const empty = (status) => ({ success: true, status, video, message: status === "login-required" ? "请先登录 B 站" : "当前视频暂无可用字幕",
+  const empty = (status) => ({ success: true, status, video,
+    message: status === "login-required" ? "请先登录 B 站" : "当前视频暂无可用字幕",
+    messageEn: status === "login-required" ? "Please log in to Bilibili" : "No subtitles available for this video",
     warnings: status === "no-subtitle" && pending ? ["SUBTITLE_PENDING"] : [] });
   try {
     // Refresh login state for each user task; cache contains no account details.

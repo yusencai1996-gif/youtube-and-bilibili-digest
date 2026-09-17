@@ -179,6 +179,34 @@ test("nav confirms logged-out state without conclusion request", async () => {
     assert.equal(result.status, "login-required"); assert.equal(c.calls.length, 2);
   }
 });
+test("bilibiliFailure always ships both message (zh) and messageEn (en)", () => {
+  const c = harness();
+  const knownCodes = [
+    "INVALID_REQUEST", "UNSUPPORTED_PAGE", "STALE_CONTEXT", "VIDEO_UNAVAILABLE",
+    "PAGE_NOT_FOUND", "RATE_LIMITED", "NETWORK_ERROR", "TIMEOUT",
+    "WBI_KEY_UNAVAILABLE", "INVALID_RESPONSE", "SUBTITLE_MISMATCH", "TAB_GONE",
+    "CONTENT_UNAVAILABLE", "PLAYER_NOT_READY", "TRANSCRIPT_NOT_READY",
+    "STORAGE_FAILED", "PANEL_OPEN_FAILED",
+  ];
+  const CJK = /[㐀-鿿]/;
+  for (const code of knownCodes) {
+    const failure = c.h.bilibiliFailure("r", Object.assign(new Error("x"), { code }));
+    assert.equal(failure.success, false);
+    assert.equal(failure.error.code, code);
+    assert.equal(typeof failure.error.message, "string", `${code} message`);
+    assert.ok(failure.error.message.length > 0, `${code} message non-empty`);
+    assert.equal(typeof failure.error.messageEn, "string", `${code} messageEn`);
+    assert.ok(failure.error.messageEn.length > 0, `${code} messageEn non-empty`);
+    assert.match(failure.error.message, CJK, `${code} message is Chinese`);
+    assert.doesNotMatch(failure.error.messageEn, CJK, `${code} messageEn is English`);
+  }
+  // Unknown or missing codes fall back to INVALID_RESPONSE, still bilingual.
+  for (const error of [new Error("boom"), Object.assign(new Error("x"), { code: "NO_SUCH_CODE" }), null]) {
+    const failure = c.h.bilibiliFailure("r", error);
+    assert.equal(failure.error.code, "INVALID_RESPONSE");
+    assert.ok(failure.error.message.length > 0 && failure.error.messageEn.length > 0);
+  }
+});
 test("logged-in empty tracks fall back to ASR, with owner and cid", async () => {
   const c = harness(chain({ subtitle: { subtitles: [] }, need_login_subtitle: true }, reply(envelope({ code: 0, model_result: { subtitle: [{ part_subtitle: [{ content: "转写", start_timestamp: 0.5, end_timestamp: 5.1 }] }] } }))));
   const result = await fetchVideo(c);

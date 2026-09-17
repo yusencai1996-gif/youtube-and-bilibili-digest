@@ -293,7 +293,7 @@ function createDigestButton() {
   const digestButton = document.createElement("button");
   digestButton.id = "ytd-digest-button";
   digestButton.type = "button";
-  digestButton.setAttribute("aria-label", "Open YouTube Digest");
+  digestButton.setAttribute("aria-label", "Open daweige digest");
   digestButton.innerHTML = `<span class="ytd-digest-label">Digest</span>`;
 
   // Style the button — rounded pill in our terracotta accent, sized to sit
@@ -1154,7 +1154,7 @@ function createBilibiliButton() {
   const button = document.createElement("button");
   button.id = BILIBILI_BUTTON_ID;
   button.type = "button";
-  button.setAttribute("aria-label", "Open YouTube Digest");
+  button.setAttribute("aria-label", "Open daweige digest");
   button.innerHTML = `<span class="ytd-bilibili-digest-label">Digest</span>`;
 
   // A quiet pill that sits comfortably beside Bilibili's own toolbar items.

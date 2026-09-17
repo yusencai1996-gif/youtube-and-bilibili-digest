@@ -3,12 +3,12 @@
   <head>
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-    <title>YouTube Digest</title>
+    <title>daweige digest</title>
     <link rel="stylesheet" href="sidepanel.css" />
   </head>
   <body>
     <!-- HEADER -->
-    <!-- Note: the panel's own "YouTube Digest" title is shown by Chrome's side-panel
+    <!-- Note: the panel's own "daweige digest" title is shown by Chrome's side-panel
          title bar, so we don't repeat a logo here. -->
     <div class="header">
       <div class="header-top">
@@ -22,8 +22,11 @@
             class="settings-btn"
             id="settingsBtn"
             type="button"
-            title="Open YouTube Digest settings"
-            aria-label="Open YouTube Digest settings"
+            title="Open daweige digest settings"
+            aria-label="Open daweige digest settings"
+            data-i18n="settingsButton"
+            data-i18n-title="settingsButtonTitle"
+            data-i18n-aria-label="settingsButtonTitle"
           >
             Settings
           </button>
@@ -32,6 +35,7 @@
             id="transcriptModeControl"
             role="group"
             aria-label="Content language"
+            data-i18n-aria-label="contentLanguageLabel"
             style="display: none"
           >
             <button
@@ -39,23 +43,27 @@
               type="button"
               data-transcript-mode="original"
               aria-pressed="true"
+              data-i18n="modeOriginal"
             >Original</button>
             <button
               class="transcript-mode-btn"
               type="button"
               data-transcript-mode="zh"
               aria-pressed="false"
+              data-i18n="modeChinese"
             >中文</button>
             <button
               class="transcript-mode-btn"
               type="button"
               data-transcript-mode="bilingual"
               aria-pressed="false"
+              data-i18n="modeBilingual"
             >双语</button>
             <span
               class="translation-spinner"
               id="langSpinner"
               aria-label="Translating"
+              data-i18n-aria-label="translatingSpinner"
             ></span>
           </div>
         </div>
@@ -63,9 +71,9 @@
 
       <!-- Tab navigation -->
       <div class="tabs" id="tabsNav" style="display: none">
-        <button class="tab active" data-tab="transcript">Transcript</button>
-        <button class="tab" data-tab="overview">Overview</button>
-        <button class="tab" data-tab="notes">Notes</button>
+        <button class="tab active" data-tab="transcript" data-i18n="tabTranscript">Transcript</button>
+        <button class="tab" data-tab="overview" data-i18n="tabOverview">Overview</button>
+        <button class="tab" data-tab="notes" data-i18n="tabNotes">Notes</button>
       </div>
     </div>
 
@@ -74,10 +82,10 @@
       <!-- WELCOME STATE -->
       <div id="welcomeState" class="welcome-container">
         <div class="welcome-icon" aria-hidden="true"></div>
-        <div class="welcome-title">Ready to Digest</div>
-        <div class="welcome-desc">
-          Navigate to a YouTube video and click the extension icon to get an
-          AI-powered digest.
+        <div class="welcome-title" data-i18n="welcomeTitle">Ready to Digest</div>
+        <div class="welcome-desc" data-i18n="welcomeDesc">
+          Open a YouTube or Bilibili video and click the extension icon to get
+          an AI-powered digest.
         </div>
       </div>
 
@@ -85,8 +93,8 @@
       <div id="loadingState" style="display: none">
         <div class="loading-container">
           <div class="loading-bar"></div>
-          <div class="loading-text" id="loadingText">Fetching transcript</div>
-          <div class="loading-subtext" id="loadingSubtext">
+          <div class="loading-text" id="loadingText" data-i18n="loadingTitle">Fetching transcript</div>
+          <div class="loading-subtext" id="loadingSubtext" data-i18n="loadingSubtitle">
             Extracting captions from video...
           </div>
         </div>
@@ -96,11 +104,11 @@
       <div id="errorState" style="display: none">
         <div class="error-container">
           <div class="error-icon" aria-hidden="true">!</div>
-          <div class="error-title" id="errorTitle">Error</div>
-          <div class="error-message" id="errorMessage">
+          <div class="error-title" id="errorTitle" data-i18n="errorTitle">Error</div>
+          <div class="error-message" id="errorMessage" data-i18n="errorGenericMessage">
             Something went wrong.
           </div>
-          <button class="error-btn" id="errorBtn">Try Again</button>
+          <button class="error-btn" id="errorBtn" data-i18n="tryAgain">Try Again</button>
         </div>
       </div>
 
@@ -110,10 +118,10 @@
         <div class="tab-panel active" data-panel="transcript">
           <div class="section">
             <div class="section-header transcript-section-header">
-              <div class="section-title">Full Transcript</div>
+              <div class="section-title" data-i18n="fullTranscript">Full Transcript</div>
               <div class="transcript-actions">
-                <button class="enhance-btn" id="copyTranscriptBtn">Copy</button>
-                <button class="enhance-btn" id="exportTranscriptBtn">
+                <button class="enhance-btn" id="copyTranscriptBtn" data-i18n="copyButton">Copy</button>
+                <button class="enhance-btn" id="exportTranscriptBtn" data-i18n="exportButton">
                   Export
                 </button>
               </div>
@@ -137,6 +145,8 @@
                 aria-controls="transcriptList"
                 autocomplete="off"
                 spellcheck="false"
+                data-i18n-placeholder="searchPlaceholder"
+                data-i18n-aria-label="searchAriaLabel"
               />
               <button
                 class="transcript-search-clear"
@@ -144,6 +154,8 @@
                 type="button"
                 aria-label="Clear transcript search"
                 title="Clear search"
+                data-i18n-aria-label="searchClearAria"
+                data-i18n-title="searchClearTitle"
                 hidden
               >
                 &times;
@@ -157,12 +169,15 @@
                 class="transcript-search-nav"
                 role="group"
                 aria-label="Search results"
+                data-i18n-aria-label="searchResultsAria"
               >
                 <button
                   id="transcriptSearchPrevBtn"
                   type="button"
                   aria-label="Previous transcript match"
                   title="Previous match (Shift + Enter)"
+                  data-i18n-aria-label="searchPrevAria"
+                  data-i18n-title="searchPrevTitle"
                   disabled
                 >
                   &#8593;
@@ -172,6 +187,8 @@
                   type="button"
                   aria-label="Next transcript match"
                   title="Next match (Enter)"
+                  data-i18n-aria-label="searchNextAria"
+                  data-i18n-title="searchNextTitle"
                   disabled
                 >
                   &#8595;
@@ -186,7 +203,7 @@
         <div class="tab-panel" data-panel="overview">
           <!-- Chapters -->
           <div class="section">
-            <div class="section-title">Chapters</div>
+            <div class="section-title" data-i18n="chaptersTitle">Chapters</div>
             <ul class="chapter-list" id="chapterList">
               <li
                 class="chapter-item"
@@ -195,6 +212,7 @@
                   cursor: default;
                   border-color: var(--border);
                 "
+                data-i18n="chaptersEmpty"
               >
                 Chapters will appear here
               </li>
@@ -203,7 +221,7 @@
 
           <!-- Key Quotes -->
           <div class="section">
-            <div class="section-title">Key Quotes</div>
+            <div class="section-title" data-i18n="quotesTitle">Key Quotes</div>
             <div id="quotesList">
               <div
                 class="quote-item"
@@ -213,7 +231,7 @@
                   cursor: default;
                 "
               >
-                <div class="quote-text" style="font-style: normal">
+                <div class="quote-text" style="font-style: normal" data-i18n="quotesEmpty">
                   Quotes will be extracted when you view this tab...
                 </div>
               </div>
@@ -225,12 +243,13 @@
         <div class="tab-panel" data-panel="notes">
           <div class="section">
             <div class="section-header">
-              <div class="section-title">Saved Notes</div>
+              <div class="section-title" data-i18n="savedNotes">Saved Notes</div>
               <div class="notes-filter">
                 <button
                   class="enhance-btn active"
                   id="notesFilterThis"
                   aria-pressed="true"
+                  data-i18n="notesThisVideo"
                 >
                   This Video
                 </button>
@@ -238,6 +257,7 @@
                   class="enhance-btn"
                   id="notesFilterAll"
                   aria-pressed="false"
+                  data-i18n="notesAll"
                 >
                   All Notes
                 </button>
@@ -253,11 +273,12 @@
       </div>
     </div>
 
-    <!-- Auto-scroll follow button — appears when user scrolls away from playback position -->
+    <!-- Auto-scroll follow button - appears when user scrolls away from playback position -->
     <button
       class="follow-playback-btn"
       id="followPlaybackBtn"
       style="display: none"
+      data-i18n="followPlayback"
     >
       Follow playback
     </button>
