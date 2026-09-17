@@ -64,9 +64,9 @@ test("AI hash filenames follow the same standalone-token rule as manual CC", () 
 test("live AI subtitle URLs without a standalone cid pass (2026-09-17 regression)", () => {
   // Shapes captured from a live video (cid 41126921074): pure-hash names for
   // ai-en/ja/es/ar, and the cid embedded inside a longer digit run for ai-zh.
-  const zhEmbedded = "https://aisubtitle.hdslb.com/bfs/ai_subtitle/prod/117132750948219411269210741bd35bb057fddc87be3.json";
+  const zhEmbedded = "https://aisubtitle.hdslb.com/bfs/ai_subtitle/prod/1171327509482194112692107401bd35bb057fddc87be3ed5b495b28da";
   for (const lan of ["ai-zh", "ai-en", "ai-ja", "ai-es", "ai-ar"]) {
-    const url = lan === "ai-zh" ? zhEmbedded : `https://aisubtitle.hdslb.com/bfs/ai_subtitle/prod/${"a1b2c3d4".repeat(4)}.json`;
+    const url = lan === "ai-zh" ? zhEmbedded : `https://aisubtitle.hdslb.com/bfs/ai_subtitle/prod/${"a1b2c3d4".repeat(4)}`;
     assert.equal(s.validateSubtitleUrl(url, "41126921074", lan), url);
     assert.equal(s.selectBilibiliTrack([{ lan, subtitle_url: url }], "41126921074").mismatch, false);
   }
