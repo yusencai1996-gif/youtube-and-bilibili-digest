@@ -16,6 +16,8 @@ const YTD_OPTIONS = (() => {
       supadataLink: "Create a Supadata account and key",
       supadataHelpSuffix:
         ". Supadata generates the key during onboarding.",
+      supadataOptional:
+        "Optional: only YouTube needs Supadata. Bilibili subtitles work without it.",
       aiProvider: "AI provider",
       providerSummaryLabel: "Supported AI provider",
       providerBadge: "Supported in this version",
@@ -60,6 +62,8 @@ const YTD_OPTIONS = (() => {
       addSupadataKey: "Add a Supadata API key.",
       addDeepseekKey: "Add a DeepSeek API key.",
       saved: "Saved. Reopen YouTube Digest to use these settings.",
+      savedWithoutSupadata:
+        "Saved. Bilibili works now; add a Supadata key later if you also use YouTube.",
       saveFailed: "Could not save settings. Please try again.",
       copying: "Copying…",
       promptCopied: "Edited prompt copied.",
@@ -85,6 +89,7 @@ const YTD_OPTIONS = (() => {
       supadataHelp: "用于获取带时间戳的 YouTube 字幕。",
       supadataLink: "创建 Supadata 账号并获取密钥",
       supadataHelpSuffix: "。Supadata 会在引导流程中生成密钥。",
+      supadataOptional: "可选：仅 YouTube 需要 Supadata；B 站字幕无需此项。",
       aiProvider: "AI 服务",
       providerSummaryLabel: "支持的 AI 服务",
       providerBadge: "当前版本支持",
@@ -128,6 +133,8 @@ const YTD_OPTIONS = (() => {
       addSupadataKey: "请添加 Supadata API 密钥。",
       addDeepseekKey: "请添加 DeepSeek API 密钥。",
       saved: "已保存。请重新打开 YouTube Digest 以使用这些设置。",
+      savedWithoutSupadata:
+        "已保存。B 站现在可用；如果你也使用 YouTube，请稍后添加 Supadata 密钥。",
       saveFailed: "无法保存设置，请重试。",
       copying: "正在复制…",
       promptCopied: "已复制编辑后的提示词。",
@@ -449,10 +456,9 @@ const YTD_OPTIONS = (() => {
         supadataApiKey: supadataApiKeyInput.value,
       });
 
-      if (!settings.supadataApiKey) {
-        setStatus(saveStatus, "addSupadataKey");
-        return;
-      }
+      // The DeepSeek key is the only hard requirement. Supadata is optional:
+      // it is used for YouTube transcripts, while Bilibili subtitles do not
+      // need any key at all.
       if (!settings.aiApiKey) {
         setStatus(saveStatus, "addDeepseekKey");
         return;
@@ -460,7 +466,10 @@ const YTD_OPTIONS = (() => {
 
       try {
         await storage.set({ [settingsApi.STORAGE_KEY]: settings });
-        setStatus(saveStatus, "saved");
+        setStatus(
+          saveStatus,
+          settings.supadataApiKey ? "saved" : "savedWithoutSupadata",
+        );
       } catch (_error) {
         setStatus(saveStatus, "saveFailed");
       }

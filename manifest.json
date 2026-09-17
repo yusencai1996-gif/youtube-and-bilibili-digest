@@ -1,6 +1,6 @@
 {
   "manifest_version": 3,
-  "name": "YouTube Digest",
+  "name": "daweige digest",
   "version": "1.2.0",
   "minimum_chrome_version": "116",
   "description": "Turn YouTube videos into learning resources with transcripts, bilingual translation, AI overviews, and notes.",
@@ -8,7 +8,9 @@
   "host_permissions": [
     "https://www.youtube.com/*",
     "https://api.supadata.ai/*",
-    "https://api.deepseek.com/*"
+    "https://api.deepseek.com/*",
+    "https://api.bilibili.com/*",
+    "https://*.hdslb.com/*"
   ],
   "action": {
     "default_title": "Open YouTube Digest",
@@ -33,6 +35,19 @@
       "matches": ["https://www.youtube.com/*"],
       "js": ["content.js"],
       "run_at": "document_idle"
+    },
+    {
+      "matches": ["https://www.bilibili.com/video/*"],
+      "js": ["bilibili-page.js"],
+      "world": "MAIN",
+      "run_at": "document_idle",
+      "all_frames": false
+    },
+    {
+      "matches": ["https://www.bilibili.com/video/*"],
+      "js": ["content.js"],
+      "run_at": "document_idle",
+      "all_frames": false
     }
   ],
   "icons": {

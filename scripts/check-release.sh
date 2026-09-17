@@ -29,6 +29,7 @@ public_allowlist=(
   "background.js"
   "settings.js"
   "content.js"
+  "bilibili-page.js"
   "sidepanel.html"
   "sidepanel.css"
   "sidepanel.js"
@@ -91,7 +92,7 @@ done
 command -v node >/dev/null 2>&1 || fail "Node.js is required"
 
 credential_scan_files=("${release_files[@]}")
-if git rev-parse --is-inside-work-tree >/dev/null 2>&1; then
+if [[ "${YTD_CHECK_SKIP_GIT:-0}" != "1" ]] && git rev-parse --is-inside-work-tree >/dev/null 2>&1; then
   while IFS= read -r -d '' file; do
     [[ -f "$file" && ! -L "$file" ]] || continue
     credential_scan_files+=("$file")

@@ -234,6 +234,10 @@ async function readBoundedAiResponse(response, onActivity) {
  * Chrome's Side Panel API lets us show a persistent panel alongside the page.
  */
 chrome.action.onClicked.addListener((tab) => {
+  if (isBilibiliVideoUrl(tab.url)) {
+    openBilibiliPanel(tab).catch(() => {});
+    return;
+  }
   if (!(tab.url || "").startsWith("https://www.youtube.com")) {
     void updatePanelForTab(tab.id, tab.url, tab.windowId);
     return;
@@ -292,6 +296,10 @@ async function closePanelForTab(tabId, windowId) {
 }
 
 async function updatePanelForTab(tabId, url, windowId) {
+  if (isBilibiliVideoUrl(url)) {
+    await chrome.sidePanel.setOptions({ tabId, path: "sidepanel.html", enabled: true }).catch(() => {});
+    return;
+  }
   const isYouTube = (url || "").startsWith("https://www.youtube.com");
   if (!isYouTube) {
     // Close the visible instance first. Then disable this tab so Chrome cannot
@@ -326,11 +334,13 @@ function getNavigationUrl(changeInfo, tab) {
 chrome.tabs.onUpdated.addListener((tabId, changeInfo, tab) => {
   const url = getNavigationUrl(changeInfo, tab);
   if (!url) return; // Ignore title and favicon-only updates.
+  invalidateBilibiliTab(tabId, url);
   void updatePanelForTab(tabId, url, tab.windowId);
 });
 
 // The user switched to a different tab (or opened a new one).
 chrome.tabs.onActivated.addListener(async ({ tabId, windowId }) => {
+  cancelInactiveBilibiliTasks(tabId, windowId);
   try {
     const tab = await chrome.tabs.get(tabId);
     void updatePanelForTab(tabId, tab.url || tab.pendingUrl, windowId);
@@ -348,6 +358,12 @@ chrome.tabs.onActivated.addListener(async ({ tabId, windowId }) => {
  * This is like a switchboard — different "actions" trigger different handlers.
  */
 chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
+  if (BILIBILI_ACTIONS.has(message.action)) {
+    handleBilibiliMessage(message, sender)
+      .then(sendResponse)
+      .catch((error) => sendResponse(bilibiliFailure(message.requestId, error)));
+    return true;
+  }
   // We need to return true to indicate we'll respond asynchronously
   if (message.action === "fetchTranscript") {
     handleFetchTranscript(message.videoId)
@@ -1724,4 +1740,586 @@ globalThis.__YTD_TRANSLATION_TESTING__ = {
   handleTranslateContent,
   closePanelForTab,
   updatePanelForTab,
+};
+
+// Bilibili transport and identity remain separate from the YouTube pipeline.
+const BILIBILI_ACTIONS = new Set([
+  "bilibiliOpenSidePanel", "bilibiliVideoChanged", "resolveBilibiliVideo",
+  "fetchBilibiliTranscript", "bilibiliRelayToContent", "saveBilibiliNote",
+]);
+const BILIBILI_MIXIN_TABLE = [46,47,18,2,53,8,23,32,15,50,10,31,58,3,45,35,27,43,5,49,33,9,42,19,29,28,14,39,12,38,41,13,37,48,7,16,24,55,40,61,26,17,0,1,60,51,30,4,22,25,54,21,56,59,6,63,57,62,11,36,20,34,44,52];
+const bilibiliBindings = new Map();
+const bilibiliTasks = new Map();
+const bilibiliBodies = new Map();
+let bilibiliTaskQueue = Promise.resolve();
+let bilibiliApiQueue = Promise.resolve();
+let bilibiliLastStart = -Infinity;
+let bilibiliCooldownUntil = 0;
+let bilibiliNav = null;
+let bilibiliNoteQueue = Promise.resolve();
+const BILIBILI_ERRORS = {
+  INVALID_REQUEST: "请求参数无效", UNSUPPORTED_PAGE: "不支持此页面",
+  STALE_CONTEXT: "视频页面已切换", VIDEO_UNAVAILABLE: "视频不可访问或无权限",
+  PAGE_NOT_FOUND: "视频分 P 不存在", RATE_LIMITED: "请求暂时受限，请稍后重试",
+  NETWORK_ERROR: "网络请求失败，请重试", TIMEOUT: "请求超时，请重试",
+  WBI_KEY_UNAVAILABLE: "签名信息暂不可用", INVALID_RESPONSE: "无法安全读取响应",
+  SUBTITLE_MISMATCH: "无法确认字幕属于当前视频", TAB_GONE: "标签页已关闭",
+  CONTENT_UNAVAILABLE: "页面脚本不可用，请刷新页面", PLAYER_NOT_READY: "播放器尚未就绪",
+  TRANSCRIPT_NOT_READY: "当前分 P 尚无可用字幕", STORAGE_FAILED: "本地存储失败",
+  PANEL_OPEN_FAILED: "侧边栏打开失败",
+};
+function bilibiliError(code, extra = {}) {
+  return Object.assign(new Error(BILIBILI_ERRORS[code] || BILIBILI_ERRORS.INVALID_RESPONSE), {
+    code, retryable: ["RATE_LIMITED", "NETWORK_ERROR", "TIMEOUT", "WBI_KEY_UNAVAILABLE",
+      "PLAYER_NOT_READY", "CONTENT_UNAVAILABLE", "STORAGE_FAILED", "PANEL_OPEN_FAILED"].includes(code), ...extra,
+  });
+}
+function bilibiliFailure(requestId, error) {
+  const safe = BILIBILI_ERRORS[error?.code] ? error : bilibiliError("INVALID_RESPONSE");
+  return { success: false, requestId, error: {
+    code: safe.code, message: BILIBILI_ERRORS[safe.code], retryable: !!safe.retryable,
+    ...(safe.code === "RATE_LIMITED" ? { retryAfterMs: Math.max(0, safe.retryAfterMs || 60000) } : {}),
+  } };
+}
+function bilibiliPositiveId(value) {
+  return (typeof value === "string" && /^[1-9]\d*$/.test(value)) ||
+    (Number.isSafeInteger(value) && value > 0);
+}
+function validateBilibiliLocator(input) {
+  if (!input || typeof input !== "object") throw bilibiliError("INVALID_REQUEST");
+  const { bvid, aid, page = 1 } = input;
+  if ((bvid != null && (typeof bvid !== "string" || !/^BV[1-9A-HJ-NP-Za-km-z]{10}$/.test(bvid))) ||
+      (aid != null && !bilibiliPositiveId(aid)) || (!bvid && !aid) ||
+      !Number.isSafeInteger(page) || page < 1) throw bilibiliError("INVALID_REQUEST");
+  return { ...(bvid ? { bvid } : {}), ...(aid ? { aid: String(aid) } : {}), page };
+}
+function parseBilibiliUrl(value) {
+  let url;
+  try { url = new URL(value); } catch { throw bilibiliError("UNSUPPORTED_PAGE"); }
+  if (url.protocol !== "https:" || url.hostname !== "www.bilibili.com" || url.port || url.username || url.password)
+    throw bilibiliError("UNSUPPORTED_PAGE");
+  const match = /^\/video\/(BV[1-9A-HJ-NP-Za-km-z]{10}|av[1-9]\d*)\/?$/.exec(url.pathname);
+  if (!match) throw bilibiliError("UNSUPPORTED_PAGE");
+  const pages = url.searchParams.getAll("p");
+  if (pages.length > 1 || (pages.length && !/^[1-9]\d*$/.test(pages[0]))) throw bilibiliError("INVALID_REQUEST");
+  return validateBilibiliLocator({ ...(match[1].startsWith("BV") ? { bvid: match[1] } : { aid: match[1].slice(2) }), page: pages.length ? Number(pages[0]) : 1 });
+}
+function isBilibiliVideoUrl(url) {
+  try { parseBilibiliUrl(url); return true; } catch { return false; }
+}
+function bilibiliFingerprint(locator) {
+  return `${locator.bvid || `av${locator.aid}`}:${locator.page}`;
+}
+function bilibiliLocatorMatches(locator, video) {
+  return locator.page === video.page && (!locator.bvid || locator.bvid === video.bvid) &&
+    (!locator.aid || locator.aid === video.aid);
+}
+function bilibiliVideoFromView(locator, data) {
+  validateBilibiliLocator(locator);
+  if (!data || !Array.isArray(data.pages) || !bilibiliPositiveId(data.aid) ||
+      !/^BV[1-9A-HJ-NP-Za-km-z]{10}$/.test(data.bvid || "")) throw bilibiliError("INVALID_RESPONSE");
+  if ((locator.bvid && locator.bvid !== data.bvid) || (locator.aid && locator.aid !== String(data.aid)))
+    throw bilibiliError("SUBTITLE_MISMATCH");
+  const part = data.pages.find((item) => item.page === locator.page);
+  if (!part) throw bilibiliError("PAGE_NOT_FOUND");
+  if (!bilibiliPositiveId(part.cid) || !Number.isFinite(part.duration) || part.duration < 0)
+    throw bilibiliError("INVALID_RESPONSE");
+  return { platform: "bilibili", bvid: data.bvid, aid: String(data.aid), cid: String(part.cid),
+    page: locator.page, videoKey: `bilibili:${data.bvid}:${part.cid}`,
+    canonicalUrl: `https://www.bilibili.com/video/${data.bvid}/?p=${locator.page}`,
+    title: typeof data.title === "string" ? data.title : "",
+    channelName: typeof data.owner?.name === "string" ? data.owner.name : "",
+    description: typeof data.desc === "string" ? data.desc : "", duration: part.duration };
+}
+
+// RFC 1321 rounds, implemented locally; no runtime library or Node dependency.
+function md5Hex(text) {
+  const bytes = new TextEncoder().encode(String(text));
+  const length = Math.ceil((bytes.length + 9) / 64) * 64;
+  const buffer = new Uint8Array(length);
+  buffer.set(bytes); buffer[bytes.length] = 0x80;
+  const view = new DataView(buffer.buffer);
+  view.setUint32(length - 8, (bytes.length * 8) >>> 0, true);
+  view.setUint32(length - 4, Math.floor(bytes.length / 0x20000000), true);
+  const shifts = [[7,12,17,22], [5,9,14,20], [4,11,16,23], [6,10,15,21]];
+  const state = [0x67452301, 0xefcdab89, 0x98badcfe, 0x10325476];
+  for (let offset = 0; offset < length; offset += 64) {
+    let [a,b,c,d] = state;
+    for (let i = 0; i < 64; i++) {
+      const round = i >>> 4;
+      const f = round === 0 ? (b & c) | (~b & d) : round === 1 ? (d & b) | (~d & c) : round === 2 ? b ^ c ^ d : c ^ (b | ~d);
+      const index = round === 0 ? i : round === 1 ? (5 * i + 1) % 16 : round === 2 ? (3 * i + 5) % 16 : (7 * i) % 16;
+      const sum = (a + f + Math.floor(Math.abs(Math.sin(i + 1)) * 0x100000000) + view.getUint32(offset + index * 4, true)) | 0;
+      const shift = shifts[round][i % 4];
+      const next = (b + ((sum << shift) | (sum >>> (32 - shift)))) | 0;
+      a = d; d = c; c = b; b = next;
+    }
+    [a,b,c,d].forEach((word, index) => { state[index] = (state[index] + word) | 0; });
+  }
+  return state.map((word) => [0,8,16,24].map((shift) => ((word >>> shift) & 255).toString(16).padStart(2, "0")).join("")).join("");
+}
+function bilibiliMixinKey(imgUrl, subUrl) {
+  const keys = [imgUrl, subUrl].map((value) => {
+    try { return /\/([a-fA-F0-9]{32})\.[a-zA-Z0-9]+$/.exec(new URL(value).pathname)?.[1]; } catch { return null; }
+  });
+  if (keys.some((key) => !key)) throw bilibiliError("WBI_KEY_UNAVAILABLE");
+  const raw = keys.join("");
+  return BILIBILI_MIXIN_TABLE.slice(0, 32).map((index) => raw[index]).join("");
+}
+function signBilibiliParams(params, mixinKey, wts = Math.floor(Date.now() / 1000)) {
+  if (!/^[a-fA-F0-9]{32}$/.test(mixinKey || "") || !Number.isSafeInteger(wts) || wts < 0)
+    throw bilibiliError("WBI_KEY_UNAVAILABLE");
+  const values = { ...params, wts };
+  delete values.w_rid;
+  const query = Object.keys(values).sort().map((key) =>
+    `${encodeURIComponent(key)}=${encodeURIComponent(String(values[key]).replace(/[!'()*]/g, ""))}`).join("&");
+  return `${query}&w_rid=${md5Hex(query + mixinKey)}`;
+}
+function validateSubtitleUrl(value, cid, language = "") {
+  if (typeof value !== "string" || !bilibiliPositiveId(cid)) throw bilibiliError("SUBTITLE_MISMATCH");
+  let url;
+  try { url = new URL(value.startsWith("//") ? `https:${value}` : value); } catch { throw bilibiliError("SUBTITLE_MISMATCH"); }
+  if (url.protocol !== "https:" || url.username || url.password || url.port ||
+      !url.hostname.endsWith(".hdslb.com")) throw bilibiliError("SUBTITLE_MISMATCH");
+  const isAI = /^ai-/i.test(language) || /(?:^|\/)ai_subtitle(?:\/|$)/i.test(url.pathname);
+  if (isAI) {
+    if (!new RegExp(`(^|[^0-9])${cid}([^0-9]|$)`).test(url.pathname)) throw bilibiliError("SUBTITLE_MISMATCH");
+  } else {
+    // Manual CC filenames are hashes; only standalone numeric tokens claim a cid.
+    // Intentionally allow hex hashes: <letter><cid>.json is not a standalone token.
+    // Accepted boundary: host allowlist + official wbi/v2 lists only + legacy API disabled.
+    const tokens = [...url.pathname.matchAll(/(?:^|[^a-z0-9])([0-9]+)(?=[^a-z0-9]|$)/gi)];
+    if (tokens.some((match) => match[1] !== String(cid))) throw bilibiliError("SUBTITLE_MISMATCH");
+  }
+  return url.href;
+}
+function bilibiliLanguage(value) {
+  const language = String(value || "").replace(/^ai-/i, "");
+  if (/^zh(?:-|$)/i.test(language)) return language === "zh" ? "zh-CN" : language;
+  return language || "und";
+}
+function convertBilibiliRows(rows, language, asr = false) {
+  if (!Array.isArray(rows)) throw bilibiliError("INVALID_RESPONSE");
+  // Only short, recognizable access-block notices imply a business failure.
+  if (!asr && rows.length && rows.length <= 8 && rows.every((row) => row &&
+      typeof row.content === "string" && row.content.trim() &&
+      !Object.prototype.hasOwnProperty.call(row, "from") && !Object.prototype.hasOwnProperty.call(row, "to")) &&
+      rows.some((row) => /无法观看|不可观看|稿件/.test(row.content)))
+    throw bilibiliError("VIDEO_UNAVAILABLE");
+  let malformed = 0;
+  const transcript = [];
+  for (const row of rows) {
+    const start = row?.[asr ? "start_timestamp" : "from"];
+    const end = row?.[asr ? "end_timestamp" : "to"];
+    if (typeof row?.content !== "string" || !Number.isFinite(start) || !Number.isFinite(end) || start < 0 || end < start) {
+      malformed++; continue;
+    }
+    const text = row.content.trim();
+    if (text) transcript.push({ text, start, duration: end - start, language });
+  }
+  if (rows.length && malformed === rows.length) throw bilibiliError("INVALID_RESPONSE");
+  return transcript.sort((a, b) => a.start - b.start);
+}
+function convertBilibiliBCC(data, language) {
+  return convertBilibiliRows(data?.body, bilibiliLanguage(language));
+}
+function convertBilibiliASR(data) {
+  if (!data || typeof data !== "object" || Array.isArray(data)) throw bilibiliError("INVALID_RESPONSE");
+  if (data.code === -1 || data.code === 1) return [];
+  if (data.code !== 0 || !data.model_result || typeof data.model_result !== "object") throw bilibiliError("INVALID_RESPONSE");
+  const groups = data.model_result.subtitle;
+  if (groups === undefined) return []; // Summary/outline alone are not transcripts.
+  if (!Array.isArray(groups) || groups.some((group) => !Array.isArray(group?.part_subtitle))) throw bilibiliError("INVALID_RESPONSE");
+  return convertBilibiliRows(groups.flatMap((group) => group.part_subtitle), "zh-CN", true);
+}
+function bilibiliTranscriptResult(video, transcript, language, source) {
+  const endSeconds = transcript.reduce((end, line) => Math.max(end, line.start + line.duration), 0);
+  return { success: true, status: "ready", video, transcript,
+    transcriptText: transcript.map((line) => line.text).join(" "),
+    transcriptTextTimestamped: transcript.map((line) => `[${Math.floor(line.start / 60)}:${String(Math.floor(line.start) % 60).padStart(2, "0")}] ${line.text}`).join("\n"),
+    language, source, originalAvailable: source !== "conclusion",
+    coverage: { endSeconds, videoDuration: video.duration,
+      possiblyPartial: video.duration - endSeconds > Math.max(30, video.duration * 0.05) }, warnings: [] };
+}
+function selectBilibiliTrack(tracks, cid) {
+  if (!Array.isArray(tracks)) throw bilibiliError("INVALID_RESPONSE");
+  const valid = [];
+  let mismatch = false;
+  let pending = false;
+  for (const track of tracks) {
+    if (!track || typeof track !== "object" || Array.isArray(track)) throw bilibiliError("INVALID_RESPONSE");
+    // Bilibili can list a track before its subtitle file has been generated.
+    if (!track.subtitle_url) { pending = true; continue; }
+    if (typeof track.lan !== "string" || typeof track.subtitle_url !== "string") throw bilibiliError("INVALID_RESPONSE");
+    try {
+      if (bilibiliLanguage(track.lan) === "und") throw bilibiliError("SUBTITLE_MISMATCH");
+      const url = validateSubtitleUrl(track.subtitle_url, cid, track.lan);
+      valid.push({ url, language: bilibiliLanguage(track.lan),
+        source: /^ai-/i.test(track.lan) || /(?:^|\/)ai_subtitle(?:\/|$)/i.test(new URL(url).pathname) ? "ai" : "cc",
+        id: String(track.id_str ?? track.id ?? "") });
+    } catch (error) { if (error.code !== "SUBTITLE_MISMATCH") throw error; mismatch = true; }
+  }
+  valid.sort((a, b) => Number(/^zh/i.test(a.language)) - Number(/^zh/i.test(b.language)) ||
+    a.language.localeCompare(b.language) || Number(a.source === "ai") - Number(b.source === "ai") || a.id.localeCompare(b.id));
+  return { track: valid[0], mismatch, pending };
+}
+
+function bilibiliCheckTask(task) {
+  if (task?.controller.signal.aborted) throw task.controller.signal.reason || bilibiliError("STALE_CONTEXT");
+  if (task && Date.now() >= task.deadline) throw bilibiliError("TIMEOUT");
+}
+function bilibiliDelay(ms, signal) {
+  return new Promise((resolve, reject) => {
+    if (signal?.aborted) { reject(signal.reason); return; }
+    const abort = () => { clearTimeout(timer); reject(signal.reason); };
+    const timer = setTimeout(() => { signal?.removeEventListener("abort", abort); resolve(); }, ms);
+    signal?.addEventListener("abort", abort, { once: true });
+  });
+}
+async function bilibiliCheckCooldown() {
+  try {
+    const saved = await chrome.storage.session.get("bilibiliCooldownUntil");
+    if (Number.isFinite(saved.bilibiliCooldownUntil)) bilibiliCooldownUntil = Math.max(bilibiliCooldownUntil, saved.bilibiliCooldownUntil);
+    const fallback = await chrome.storage.local.get("bilibiliCooldownUntil");
+    if (Number.isFinite(fallback.bilibiliCooldownUntil)) bilibiliCooldownUntil = Math.max(bilibiliCooldownUntil, fallback.bilibiliCooldownUntil);
+  } catch { throw bilibiliError("STORAGE_FAILED"); }
+  if (Date.now() < bilibiliCooldownUntil) throw bilibiliError("RATE_LIMITED", { retryAfterMs: bilibiliCooldownUntil - Date.now() });
+}
+async function bilibiliEnterCooldown(response) {
+  const value = response.headers?.get("Retry-After");
+  const seconds = value === null || value === undefined ? NaN : Number(value);
+  const wait = Number.isFinite(seconds) ? seconds * 1000 : Date.parse(value) - Date.now();
+  bilibiliCooldownUntil = Math.max(bilibiliCooldownUntil, Date.now() + Math.max(60000, Number.isFinite(wait) ? wait : 0));
+  try { await chrome.storage.session.set({ bilibiliCooldownUntil }); }
+  catch {
+    // Only a deadline is persisted; this fallback contains no account data.
+    try { await chrome.storage.local.set({ bilibiliCooldownUntil }); }
+    catch { throw bilibiliError("STORAGE_FAILED"); }
+  }
+  throw bilibiliError("RATE_LIMITED", { retryAfterMs: bilibiliCooldownUntil - Date.now() });
+}
+async function bilibiliAssertContext(tabId, locator) {
+  let tab;
+  try { tab = await chrome.tabs.get(tabId); } catch { throw bilibiliError("TAB_GONE"); }
+  const actual = parseBilibiliUrl(tab.pendingUrl || tab.url);
+  const active = await chrome.tabs.query({ active: true, windowId: tab.windowId });
+  if (!active.some((candidate) => candidate.id === tabId) ||
+      (locator && !bilibiliLocatorMatches(actual, locator))) throw bilibiliError("STALE_CONTEXT");
+  return { tab, locator: actual };
+}
+async function bilibiliRequest(url, task, { subtitle = false, cid } = {}) {
+  const execute = async () => {
+    bilibiliCheckTask(task);
+    await bilibiliCheckCooldown();
+    const delay = bilibiliLastStart + 1200 - Date.now();
+    if (delay > 0) await bilibiliDelay(delay, task?.controller.signal);
+    bilibiliCheckTask(task);
+    if (task) await bilibiliAssertContext(task.tabId, task.locator);
+    await bilibiliCheckCooldown();
+    bilibiliCheckTask(task);
+    bilibiliLastStart = Date.now();
+    const controller = new AbortController();
+    const abort = () => controller.abort(task.controller.signal.reason);
+    task?.controller.signal.addEventListener("abort", abort, { once: true });
+    const timer = setTimeout(() => controller.abort(bilibiliError("TIMEOUT")), Math.min(15000, task ? Math.max(1, task.deadline - Date.now()) : 15000));
+    try {
+      // redirect:"error" refuses to follow redirects; fetch rejects and becomes NETWORK_ERROR.
+      const response = await fetch(url, { credentials: subtitle ? "omit" : "include", redirect: "error", signal: controller.signal });
+      if (response.status === 412 || response.status === 429) await bilibiliEnterCooldown(response);
+      if (response.redirected || (response.url && response.url !== url)) {
+        if (subtitle) validateSubtitleUrl(response.url, cid);
+        throw bilibiliError(subtitle ? "SUBTITLE_MISMATCH" : "INVALID_RESPONSE");
+      }
+      if (subtitle && [401, 403, 404].includes(response.status)) throw bilibiliError("NETWORK_ERROR", { subtitleExpired: true });
+      if (response.status === 401 || response.status === 403 || response.status === 404) throw bilibiliError("VIDEO_UNAVAILABLE");
+      if (!response.ok) throw bilibiliError("NETWORK_ERROR");
+      let body;
+      try { body = await response.json(); } catch { throw bilibiliError("INVALID_RESPONSE"); }
+      bilibiliCheckTask(task);
+      if (!body || typeof body !== "object" || Array.isArray(body)) throw bilibiliError("INVALID_RESPONSE");
+      if (body.code === -352 || body.v_voucher || body.data?.v_voucher) await bilibiliEnterCooldown(response);
+      if (!subtitle) {
+        if (body.code === -101) throw bilibiliError("VIDEO_UNAVAILABLE", { loginRequired: true });
+        if (body.code === -403 && /(?:wbi|signature|签名).*(?:expired|invalid|过期|失效|错误)/i.test(String(body.message || "")))
+          throw bilibiliError("WBI_KEY_UNAVAILABLE", { signatureExpired: true });
+        if ([-400,-403,-404,-10403,62002,62004].includes(body.code)) throw bilibiliError("VIDEO_UNAVAILABLE");
+        // Only conclusion uses these outer codes to report an explicit empty result.
+        if (new URL(url).pathname === "/x/web-interface/view/conclusion/get" && (body.code === -1 || body.code === 1))
+          return { code: body.code };
+        if (body.code !== 0 || !body.data || typeof body.data !== "object") throw bilibiliError("INVALID_RESPONSE");
+        return body.data;
+      }
+      return body;
+    } catch (error) {
+      if (controller.signal.aborted) throw controller.signal.reason || bilibiliError("TIMEOUT");
+      if (error?.code && BILIBILI_ERRORS[error.code]) throw error;
+      throw bilibiliError("NETWORK_ERROR");
+    } finally {
+      clearTimeout(timer);
+      task?.controller.signal.removeEventListener("abort", abort);
+    }
+  };
+  const pending = bilibiliApiQueue.then(execute);
+  bilibiliApiQueue = pending.catch(() => {});
+  return pending;
+}
+async function bilibiliGetNav(task, refresh = false) {
+  if (!refresh && bilibiliNav && Date.now() - bilibiliNav.at < 86400000) return bilibiliNav;
+  let data;
+  try { data = await bilibiliRequest("https://api.bilibili.com/x/web-interface/nav", task); }
+  catch (error) { if (error.loginRequired) return { loggedIn: false }; throw error; }
+  if (typeof data.isLogin !== "boolean") throw bilibiliError("INVALID_RESPONSE");
+  if (!data.isLogin) return { loggedIn: false };
+  bilibiliNav = { loggedIn: data.isLogin, mixinKey: bilibiliMixinKey(data.wbi_img?.img_url, data.wbi_img?.sub_url), at: Date.now() };
+  return bilibiliNav;
+}
+async function bilibiliSignedRequest(path, params, task, nav) {
+  try { return await bilibiliRequest(`https://api.bilibili.com${path}?${signBilibiliParams(params, nav.mixinKey)}`, task); }
+  catch (error) {
+    if (!error.signatureExpired) throw error;
+    const fresh = await bilibiliGetNav(task, true);
+    if (!fresh.loggedIn) throw bilibiliError("VIDEO_UNAVAILABLE", { loginRequired: true });
+    return bilibiliRequest(`https://api.bilibili.com${path}?${signBilibiliParams(params, fresh.mixinKey)}`, task);
+  }
+}
+async function resolveBilibiliVideo(tabId, locator, task) {
+  locator = validateBilibiliLocator(locator);
+  const { tab, locator: actual } = await bilibiliAssertContext(tabId);
+  if (locator.page !== actual.page || (actual.bvid && locator.bvid !== actual.bvid) || (actual.aid && locator.aid !== actual.aid))
+    throw bilibiliError("STALE_CONTEXT");
+  const fingerprint = bilibiliFingerprint(actual);
+  const cached = bilibiliBindings.get(tabId);
+  if (cached?.fingerprint === fingerprint && Date.now() - cached.at < 300000 && bilibiliLocatorMatches(locator, cached.video)) return cached.video;
+  const query = actual.bvid ? `bvid=${actual.bvid}` : `aid=${actual.aid}`;
+  const data = await bilibiliRequest(`https://api.bilibili.com/x/web-interface/view?${query}`, task);
+  const video = bilibiliVideoFromView(locator, data);
+  await bilibiliAssertContext(tabId, video);
+  bilibiliCheckTask(task);
+  if (!bilibiliPositiveId(data.owner?.mid)) throw bilibiliError("INVALID_RESPONSE");
+  bilibiliBindings.set(tabId, { fingerprint, video, mid: String(data.owner.mid), at: Date.now(), windowId: tab.windowId });
+  return video;
+}
+function validateBilibiliVideo(video) {
+  validateBilibiliLocator(video);
+  if (video.platform !== "bilibili" || !bilibiliPositiveId(video.cid) || typeof video.cid !== "string" ||
+      typeof video.aid !== "string" || !video.bvid || video.videoKey !== `bilibili:${video.bvid}:${video.cid}`)
+    throw bilibiliError("INVALID_REQUEST");
+}
+async function bilibiliBoundVideo(tabId, supplied, task) {
+  validateBilibiliVideo(supplied);
+  const { locator } = await bilibiliAssertContext(tabId, supplied);
+  if (!task) {
+    const video = await runBilibiliTask(tabId, locator, "binding", (current) => bilibiliBoundVideo(tabId, supplied, current));
+    if (["bvid","aid","cid","page","videoKey"].some((field) => supplied[field] !== video[field])) throw bilibiliError("STALE_CONTEXT");
+    return video;
+  }
+  const video = await resolveBilibiliVideo(tabId, { ...locator, bvid: supplied.bvid, aid: supplied.aid }, task);
+  if (["bvid","aid","cid","page","videoKey"].some((field) => supplied[field] !== video[field])) throw bilibiliError("STALE_CONTEXT");
+  return video;
+}
+function runBilibiliTask(tabId, locator, kind, execute) {
+  const key = `${tabId}:${bilibiliFingerprint(locator)}:${kind}`;
+  const existing = bilibiliTasks.get(key);
+  if (existing && !existing.controller.signal.aborted) return existing.promise;
+  const task = { tabId, locator, controller: new AbortController(), deadline: Date.now() + 90000,
+    windowId: bilibiliBindings.get(tabId)?.windowId };
+  const timer = setTimeout(() => task.controller.abort(bilibiliError("TIMEOUT")), 90000);
+  const work = bilibiliTaskQueue.then(async () => {
+    bilibiliCheckTask(task);
+    const { tab } = await bilibiliAssertContext(tabId, locator);
+    task.windowId = tab.windowId;
+    const result = await execute(task);
+    bilibiliCheckTask(task);
+    await bilibiliAssertContext(tabId, locator);
+    return result;
+  });
+  let abortListener;
+  const cancelled = new Promise((resolve, reject) => {
+    abortListener = () => reject(task.controller.signal.reason);
+    task.controller.signal.addEventListener("abort", abortListener, { once: true });
+  });
+  task.promise = Promise.race([work, cancelled]).finally(() => {
+    clearTimeout(timer);
+    task.controller.signal.removeEventListener("abort", abortListener);
+    if (bilibiliTasks.get(key) === task) bilibiliTasks.delete(key);
+  });
+  bilibiliTaskQueue = work.catch(() => {});
+  bilibiliTasks.set(key, task);
+  return task.promise;
+}
+function invalidateBilibiliTab(tabId, url) {
+  let locator;
+  try { locator = parseBilibiliUrl(url); } catch { /* Leaving a supported page. */ }
+  const binding = bilibiliBindings.get(tabId);
+  if (!locator || binding?.fingerprint !== bilibiliFingerprint(locator)) bilibiliBindings.delete(tabId);
+  for (const task of bilibiliTasks.values()) {
+    if (task.tabId === tabId && (!locator || !bilibiliLocatorMatches(locator, task.locator)))
+      task.controller.abort(bilibiliError("STALE_CONTEXT"));
+  }
+}
+function cancelInactiveBilibiliTasks(tabId, windowId) {
+  for (const task of bilibiliTasks.values()) {
+    if (task.tabId !== tabId && (task.windowId === undefined || task.windowId === windowId))
+      task.controller.abort(bilibiliError("STALE_CONTEXT"));
+  }
+}
+async function fetchBilibiliTranscript(tabId, supplied, task) {
+  const video = await bilibiliBoundVideo(tabId, supplied, task);
+  // An empty/failed refresh must not leave an old transcript usable for notes.
+  bilibiliBodies.set(video.videoKey, { transcript: [], at: Date.now() });
+  let pending = false;
+  const empty = (status) => ({ success: true, status, video, message: status === "login-required" ? "请先登录 B 站" : "当前视频暂无可用字幕",
+    warnings: status === "no-subtitle" && pending ? ["SUBTITLE_PENDING"] : [] });
+  try {
+    // Refresh login state for each user task; cache contains no account details.
+    const nav = await bilibiliGetNav(task, true);
+    if (!nav.loggedIn) return empty("login-required");
+    for (let attempt = 0; attempt < 2; attempt++) {
+      const data = await bilibiliSignedRequest("/x/player/wbi/v2", { bvid: video.bvid, cid: video.cid }, task, nav);
+      if (!data.subtitle || !Array.isArray(data.subtitle.subtitles)) throw bilibiliError("INVALID_RESPONSE");
+      const selected = selectBilibiliTrack(data.subtitle.subtitles, video.cid);
+      pending ||= selected.pending;
+      if (!selected.track) break;
+      const { track } = selected;
+      let body;
+      try { body = await bilibiliRequest(track.url, task, { subtitle: true, cid: video.cid }); }
+      catch (error) {
+        if (error.subtitleExpired && attempt === 0) continue;
+        throw error;
+      }
+      const transcript = convertBilibiliBCC(body, track.language);
+      if (!transcript.length) break;
+      const result = bilibiliTranscriptResult(video, transcript, track.language, track.source);
+      await bilibiliAssertContext(tabId, video);
+      bilibiliCheckTask(task);
+      bilibiliBodies.set(video.videoKey, { transcript, at: Date.now() });
+      return result;
+    }
+    const mid = bilibiliBindings.get(tabId)?.mid;
+    if (!mid) throw bilibiliError("STALE_CONTEXT");
+    const data = await bilibiliSignedRequest("/x/web-interface/view/conclusion/get", { bvid: video.bvid, cid: video.cid, up_mid: mid }, task, bilibiliNav || nav);
+    const transcript = convertBilibiliASR(data);
+    // Explicit ASR emptiness wins over rejected tracks; technical failures still throw.
+    if (!transcript.length) return empty("no-subtitle");
+    const result = bilibiliTranscriptResult(video, transcript, "zh-CN", "conclusion");
+    await bilibiliAssertContext(tabId, video);
+    bilibiliCheckTask(task);
+    bilibiliBodies.set(video.videoKey, { transcript, at: Date.now() });
+    return result;
+  } catch (error) {
+    if (error.loginRequired) return empty("login-required");
+    throw error;
+  }
+}
+
+function openBilibiliPanel(tab) {
+  // Keep open in the original user-gesture stack, before any await.
+  try {
+    chrome.sidePanel.setOptions({ tabId: tab.id, path: "sidepanel.html", enabled: true }).catch(() => {});
+    return Promise.resolve(chrome.sidePanel.open({ tabId: tab.id })).then(() => {
+      chrome.runtime.sendMessage({ action: "bilibiliPanelOpened", tabId: tab.id, windowId: tab.windowId }).catch(() => {});
+    }).catch(() => { throw bilibiliError("PANEL_OPEN_FAILED"); });
+  } catch { return Promise.reject(bilibiliError("PANEL_OPEN_FAILED")); }
+}
+async function handleSaveBilibiliNote(message) {
+  const { tabId, timestamp, selectedText } = message;
+  if (!Number.isFinite(timestamp) || timestamp < 0 || (selectedText !== undefined && typeof selectedText !== "string")) throw bilibiliError("INVALID_REQUEST");
+  const video = await bilibiliBoundVideo(tabId, message.video);
+  let transcript = bilibiliBodies.get(video.videoKey)?.transcript;
+  if (!transcript) {
+    try { transcript = (await chrome.storage.local.get(`digest_${video.videoKey}`))[`digest_${video.videoKey}`]?.transcript; }
+    catch { throw bilibiliError("STORAGE_FAILED"); }
+  }
+  if (!Array.isArray(transcript) || !transcript.length || transcript.some((line) => typeof line?.text !== "string" || !Number.isFinite(line.start)))
+    throw bilibiliError("TRANSCRIPT_NOT_READY");
+  const seconds = Math.floor(Math.min(timestamp, video.duration));
+  let rawText = selectedText?.trim() ? selectedText : "";
+  let text = rawText;
+  if (!rawText) {
+    const index = transcript.findLastIndex((line) => line.start <= timestamp);
+    if (index < 0) throw bilibiliError("TRANSCRIPT_NOT_READY");
+    rawText = transcript[index].text;
+    text = await cleanupNoteText(rawText, transcript.slice(Math.max(0, index - 2), index).map((line) => line.text).join(" "),
+      transcript.slice(index + 1, index + 5).map((line) => line.text).join(" "),
+      transcript.slice(Math.max(0, index - 8), index + 13).map((line) => line.text).join(" "), video.title);
+  }
+  const note = { id: `note_${Date.now()}_${Math.random().toString(36).slice(2, 10)}`, platform: "bilibili",
+    bvid: video.bvid, cid: video.cid, page: video.page, videoId: video.videoKey,
+    videoTitle: video.title.slice(0, 500), channelName: video.channelName.slice(0, 300),
+    timestamp: `${Math.floor(seconds / 60)}:${String(seconds % 60).padStart(2, "0")}`, timestampSeconds: seconds,
+    timestampedUrl: `${video.canonicalUrl}&t=${seconds}`, text, rawText, createdAt: Date.now() };
+  const save = bilibiliNoteQueue.then(async () => {
+    await bilibiliAssertContext(tabId, video);
+    try { await saveNoteToStorage(note); } catch { throw bilibiliError("STORAGE_FAILED"); }
+  });
+  bilibiliNoteQueue = save.catch(() => {});
+  await save;
+  chrome.runtime.sendMessage({ action: "noteSaved", note }).catch(() => {});
+  return { success: true, note };
+}
+async function handleBilibiliMessage(message, sender) {
+  if (sender.id !== chrome.runtime.id || typeof message.requestId !== "string" || !message.requestId || message.requestId.length > 200)
+    throw bilibiliError("INVALID_REQUEST");
+  const ok = (value = {}) => ({ success: true, requestId: message.requestId, ...value });
+  if (["bilibiliOpenSidePanel", "bilibiliVideoChanged"].includes(message.action)) {
+    if (!sender.tab || sender.frameId !== 0 || !isBilibiliVideoUrl(sender.url) || !isBilibiliVideoUrl(sender.tab.url))
+      throw bilibiliError("UNSUPPORTED_PAGE");
+    if (bilibiliFingerprint(parseBilibiliUrl(sender.url)) !== bilibiliFingerprint(parseBilibiliUrl(sender.tab.url))) throw bilibiliError("STALE_CONTEXT");
+    if (message.action === "bilibiliOpenSidePanel") {
+      await openBilibiliPanel(sender.tab);
+      return ok();
+    }
+    const locator = validateBilibiliLocator(message.locator);
+    const actual = parseBilibiliUrl(sender.tab.url);
+    if (!bilibiliLocatorMatches(actual, locator)) throw bilibiliError("STALE_CONTEXT");
+    invalidateBilibiliTab(sender.tab.id, sender.tab.url);
+    // Original content event also reaches sidepanel with sender.tab intact.
+    return ok();
+  }
+  if (sender.tab || sender.url !== chrome.runtime.getURL("sidepanel.html") || !Number.isInteger(message.tabId) || message.tabId < 0)
+    throw bilibiliError("INVALID_REQUEST");
+  const { locator } = await bilibiliAssertContext(message.tabId);
+  if (message.action === "resolveBilibiliVideo") {
+    const requested = validateBilibiliLocator(message.locator);
+    // Check each caller before coalescing requests with the same URL identity.
+    if (!bilibiliLocatorMatches(locator, requested)) throw bilibiliError("STALE_CONTEXT");
+    const video = await runBilibiliTask(message.tabId, requested, "resolve", (task) => resolveBilibiliVideo(message.tabId, requested, task));
+    if (!bilibiliLocatorMatches(requested, video)) throw bilibiliError("STALE_CONTEXT");
+    return ok({ video });
+  }
+  if (message.action === "fetchBilibiliTranscript") {
+    validateBilibiliVideo(message.video);
+    if (!bilibiliLocatorMatches(locator, message.video)) throw bilibiliError("STALE_CONTEXT");
+    if (message.forceRefresh !== undefined && typeof message.forceRefresh !== "boolean") throw bilibiliError("INVALID_REQUEST");
+    const result = await runBilibiliTask(message.tabId, locator, "transcript", (task) => fetchBilibiliTranscript(message.tabId, message.video, task));
+    // Do not let a forged cid piggyback on an already-running valid request.
+    if (["bvid", "aid", "cid", "page", "videoKey"].some((field) => message.video[field] !== result.video[field])) throw bilibiliError("STALE_CONTEXT");
+    return ok(result);
+  }
+  if (message.action === "saveBilibiliNote") return ok(await handleSaveBilibiliNote(message));
+  if (message.action === "bilibiliRelayToContent") {
+    const action = message.payload?.action;
+    if (!["bilibiliGetPageInfo", "bilibiliGetCurrentTime", "bilibiliSeekTo"].includes(action)) throw bilibiliError("INVALID_REQUEST");
+    const payload = { action };
+    if (action !== "bilibiliGetPageInfo") payload.video = await bilibiliBoundVideo(message.tabId, message.payload.video);
+    if (action === "bilibiliSeekTo") {
+      if (!Number.isFinite(message.payload.seconds) || message.payload.seconds < 0) throw bilibiliError("INVALID_REQUEST");
+      payload.seconds = Math.min(message.payload.seconds, payload.video.duration);
+    }
+    let response;
+    try { response = await chrome.tabs.sendMessage(message.tabId, payload, { frameId: 0 }); }
+    catch { throw bilibiliError("CONTENT_UNAVAILABLE"); }
+    await bilibiliAssertContext(message.tabId, locator);
+    if (!response?.success) throw bilibiliError(BILIBILI_ERRORS[response?.error?.code] ? response.error.code : "CONTENT_UNAVAILABLE");
+    return ok({ response });
+  }
+  throw bilibiliError("INVALID_REQUEST");
+}
+
+globalThis.__YTD_BILIBILI_TESTING__ = {
+  md5Hex, bilibiliMixinKey, signBilibiliParams, validateBilibiliLocator, parseBilibiliUrl,
+  bilibiliVideoFromView, validateSubtitleUrl, convertBilibiliBCC, convertBilibiliASR,
+  bilibiliTranscriptResult, selectBilibiliTrack, handleBilibiliMessage, bilibiliFailure,
+  resolveBilibiliVideo, fetchBilibiliTranscript, runBilibiliTask, bilibiliRequest,
+  invalidateBilibiliTab, cancelInactiveBilibiliTasks, handleSaveBilibiliNote,
 };

@@ -31,6 +31,31 @@ let digestButtonObserver = null;
 let digestButtonReconcileTimer = null;
 let digestButtonResizeListenerAdded = false;
 
+// --- Bilibili state ---
+// Declared up here (not near the functions below) because init() runs at
+// load time and immediately touches this state on Bilibili pages.
+const BILIBILI_BRIDGE_CHANNEL = "ytd-bilibili-v1";
+const BILIBILI_BRIDGE_TIMEOUT_MS = 2000;
+const BILIBILI_FINGERPRINT_INTERVAL_MS = 1000;
+const BILIBILI_PLAYER_WAIT_TIMEOUT_MS = 4000;
+const BILIBILI_BUTTON_ID = "ytd-bilibili-digest-button";
+
+// BV ids are fixed-length ("BV1" + 9 base58 chars, no 0/I/O/l). av ids are
+// plain positive integers. We never convert between the two.
+const BILIBILI_BV_PATTERN = /^BV1[1-9A-HJ-NP-Za-km-z]{9}$/;
+const BILIBILI_AV_PATTERN = /^av([1-9]\d*)$/i;
+
+let bilibiliActive = false;
+let bilibiliDigestButton = null;
+let bilibiliButtonObserver = null;
+let bilibiliPlayerObserver = null;
+let bilibiliFingerprintTimer = null;
+let bilibiliLastFingerprint = null;
+let bilibiliBridgePending = null; // { requestId, resolve, timerId, promise }
+let bilibiliPlayerWaitTimer = null;
+let bilibiliPlayerWaitSettle = null; // settles the in-flight hydration wait
+let bilibiliPersistentListenersAdded = false;
+
 // ============================================================
 // INITIALIZATION
 // ============================================================
@@ -38,8 +63,16 @@ let digestButtonResizeListenerAdded = false;
 /**
  * When the page loads, inject our Digest button and Note button.
  * We wait a bit for YouTube's UI to fully render.
+ *
+ * On Bilibili video pages the same content script takes a completely separate
+ * path: no YouTube observers or keyboard shortcuts are registered there.
  */
 function init() {
+  if (isBilibiliHost()) {
+    if (isBilibiliVideoPage()) initBilibili();
+    return;
+  }
+
   // Register the global "n" keyboard shortcut once
   if (!ytdNoteKeyboardListenerAdded) {
     document.addEventListener("keydown", handleNoteKeyboardShortcut);
@@ -123,6 +156,35 @@ if (document.readyState === "loading") {
  */
 chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
   debugLog("[YouTube Digest Content] Received message:", message.action, message);
+
+  // --- Bilibili actions (relayed from the background worker) ---
+  // These are only meaningful on Bilibili video pages; the handlers check the
+  // page themselves and refuse anything else.
+  if (message.action === "bilibiliGetPageInfo") {
+    getBilibiliPageInfo()
+      .then(sendResponse)
+      .catch((error) =>
+        sendResponse({
+          success: false,
+          error: {
+            code: "CONTENT_UNAVAILABLE",
+            message: error?.message || "Could not read this page.",
+            retryable: true,
+          },
+        }),
+      );
+    return true; // Async response (waits at most ~2s for the MAIN bridge)
+  }
+
+  if (message.action === "bilibiliGetCurrentTime") {
+    sendResponse(handleBilibiliGetCurrentTime(message));
+    return false;
+  }
+
+  if (message.action === "bilibiliSeekTo") {
+    // May wait briefly for the player to hydrate before answering.
+    return handleBilibiliSeekTo(message, sendResponse);
+  }
 
   if (message.action === "getVideoInfo") {
     // Read video title and channel name from the page
@@ -837,3 +899,855 @@ document.addEventListener("yt-navigate-finish", () => {
     tryInjectNoteButton();
   }, 500);
 });
+
+// ============================================================
+// BILIBILI SUPPORT
+// ============================================================
+// Everything below runs only on https://www.bilibili.com/video/*. It owns:
+//   - the postMessage bridge to bilibili-page.js (MAIN world)
+//   - the Digest button in Bilibili's action toolbar
+//   - SPA navigation awareness (fingerprint polling + popstate)
+//   - player reads and timestamp seeks with identity checks
+//
+// Bilibili's page can interfere with its own MAIN world, so bridge answers
+// are hints. The background worker re-validates identity via the view API.
+
+// ------------------------------------------------------------
+// URL identity
+// ------------------------------------------------------------
+
+function isBilibiliHost() {
+  return window.location.hostname === "www.bilibili.com";
+}
+
+function isBilibiliVideoPage() {
+  return (
+    isBilibiliHost() && window.location.pathname.startsWith("/video/")
+  );
+}
+
+/**
+ * Parses the video identity out of a Bilibili URL. Only the pathname and the
+ * "p" query parameter identify the video; tracking parameters and the "t"
+ * timestamp are ignored. Returns null when the URL is not a plain video page
+ * or the page parameter is malformed.
+ *
+ * @returns {{bvid: string|null, aid: string|null, page: number} | null}
+ */
+function parseBilibiliLocatorFromUrl(rawUrl) {
+  let url;
+  try {
+    url = new URL(rawUrl);
+  } catch (_error) {
+    return null;
+  }
+  if (url.hostname !== "www.bilibili.com") return null;
+
+  const match = url.pathname.match(/^\/video\/([^/]+)\/?$/);
+  if (!match) return null;
+
+  const segment = match[1];
+  let bvid = null;
+  let aid = null;
+  if (BILIBILI_BV_PATTERN.test(segment)) {
+    bvid = segment;
+  } else {
+    const avMatch = segment.match(BILIBILI_AV_PATTERN);
+    if (avMatch) aid = avMatch[1];
+  }
+  if (!bvid && !aid) return null;
+
+  let page = 1;
+  const rawPage = url.searchParams.get("p");
+  if (rawPage !== null) {
+    if (!/^[1-9]\d*$/.test(rawPage)) return null;
+    page = Number(rawPage);
+  }
+
+  return { bvid, aid, page };
+}
+
+function getCurrentBilibiliLocator() {
+  return parseBilibiliLocatorFromUrl(window.location.href);
+}
+
+/**
+ * The navigation fingerprint: video id + part number. Ignores t, spm, and
+ * other non-identity parameters so random query noise does not look like a
+ * navigation.
+ */
+function computeBilibiliFingerprint(locator) {
+  if (!locator) return null;
+  return `${locator.bvid || `av${locator.aid}`}|p${locator.page}`;
+}
+
+/**
+ * Wire form of a locator. The background validator accepts only ABSENT
+ * fields — an explicit null is INVALID_REQUEST — so a BV address sends
+ * {bvid, page} and an av address sends {aid, page}, never the null twin.
+ * cidHint rides along only when the MAIN-world state actually provided one.
+ */
+function serializeBilibiliLocator(locator) {
+  const out = {};
+  if (locator.bvid !== null && locator.bvid !== undefined) {
+    out.bvid = locator.bvid;
+  }
+  if (locator.aid !== null && locator.aid !== undefined) {
+    out.aid = locator.aid;
+  }
+  out.page = locator.page;
+  if (locator.cidHint !== null && locator.cidHint !== undefined) {
+    out.cidHint = locator.cidHint;
+  }
+  return out;
+}
+
+function createBilibiliRequestId() {
+  return `bili-${Date.now()}-${Math.random().toString(36).slice(2, 10)}`;
+}
+
+// ------------------------------------------------------------
+// Lifecycle
+// ------------------------------------------------------------
+
+function initBilibili() {
+  if (bilibiliActive) return;
+  bilibiliActive = true;
+
+  addBilibiliPersistentListeners();
+  injectBilibiliButton();
+  setupBilibiliButtonObserver();
+  bilibiliLastFingerprint = computeBilibiliFingerprint(
+    getCurrentBilibiliLocator(),
+  );
+  startBilibiliFingerprintPolling();
+}
+
+/**
+ * Full teardown when the page leaves the supported surface: remove the
+ * button, stop the poller, disconnect the local observers, and settle any
+ * in-flight bridge read so nothing keeps tracking the old page.
+ */
+function cleanupBilibili() {
+  bilibiliActive = false;
+  bilibiliLastFingerprint = null;
+
+  if (bilibiliFingerprintTimer) {
+    clearInterval(bilibiliFingerprintTimer);
+    bilibiliFingerprintTimer = null;
+  }
+  if (bilibiliButtonObserver) {
+    bilibiliButtonObserver.disconnect();
+    bilibiliButtonObserver = null;
+  }
+  cancelBilibiliPlayerWait();
+
+  document
+    .querySelectorAll(`#${BILIBILI_BUTTON_ID}`)
+    .forEach((button) => button.remove());
+  bilibiliDigestButton = null;
+
+  if (bilibiliBridgePending) {
+    clearTimeout(bilibiliBridgePending.timerId);
+    const pending = bilibiliBridgePending;
+    bilibiliBridgePending = null;
+    pending.resolve(null);
+  }
+}
+
+/**
+ * popstate and the bridge message listener stay registered for the life of
+ * the content script. They are what lets us come back after a SPA navigation
+ * away from (and back to) a video page.
+ */
+function addBilibiliPersistentListeners() {
+  if (bilibiliPersistentListenersAdded) return;
+  window.addEventListener("popstate", handleBilibiliPopstate);
+  window.addEventListener("message", handleBilibiliBridgeMessage);
+  bilibiliPersistentListenersAdded = true;
+}
+
+function handleBilibiliPopstate() {
+  if (isBilibiliVideoPage()) {
+    if (bilibiliActive) bilibiliFingerprintTick();
+    else initBilibili();
+  } else if (bilibiliActive) {
+    cleanupBilibili();
+  }
+}
+
+// ------------------------------------------------------------
+// SPA navigation awareness (fingerprint polling + popstate)
+// ------------------------------------------------------------
+
+function startBilibiliFingerprintPolling() {
+  if (bilibiliFingerprintTimer) return;
+  bilibiliFingerprintTimer = setInterval(
+    bilibiliFingerprintTick,
+    BILIBILI_FINGERPRINT_INTERVAL_MS,
+  );
+}
+
+function bilibiliFingerprintTick() {
+  if (!bilibiliActive) return;
+  if (!isBilibiliVideoPage()) {
+    cleanupBilibili();
+    return;
+  }
+
+  // Hydration can finish AFTER init's single attempt: retry the local
+  // observer (a no-op once created) and the injection itself until the
+  // button is actually connected. Both calls are idempotent.
+  setupBilibiliButtonObserver();
+  if (!bilibiliDigestButton || !bilibiliDigestButton.isConnected) {
+    injectBilibiliButton();
+  }
+
+  const locator = getCurrentBilibiliLocator();
+  const fingerprint = computeBilibiliFingerprint(locator);
+  if (!fingerprint) return; // Unrecognized URL shape — leave state alone.
+  if (fingerprint !== bilibiliLastFingerprint) {
+    bilibiliLastFingerprint = fingerprint;
+    handleBilibiliNavigation(locator);
+  }
+}
+
+/**
+ * A video or part change: re-check the button (the toolbar may have been
+ * rebuilt) and notify the background worker. We never fetch subtitles here —
+ * the side panel drives that through resolveBilibiliVideo.
+ */
+function handleBilibiliNavigation(locator) {
+  // A video/part change settles any seek still waiting for player hydration:
+  // its callback re-validates identity and answers STALE_CONTEXT instead of
+  // seeking the new part to the old timestamp.
+  cancelBilibiliPlayerWait();
+  injectBilibiliButton();
+  try {
+    const sent = chrome.runtime.sendMessage({
+      action: "bilibiliVideoChanged",
+      requestId: createBilibiliRequestId(),
+      locator: serializeBilibiliLocator(locator),
+    });
+    Promise.resolve(sent).catch(() => {});
+  } catch (error) {
+    debugLog("[YouTube Digest Content] bilibiliVideoChanged failed:", error);
+  }
+}
+
+// ------------------------------------------------------------
+// Digest button injection (action toolbar)
+// ------------------------------------------------------------
+
+/**
+ * Preferred host is the left side of the action toolbar (next to like/coin);
+ * the title area is the documented fallback. Both exist in the SSR HTML.
+ */
+function findBilibiliButtonHost() {
+  return (
+    document.querySelector("#arc_toolbar_report .video-toolbar-left-main") ||
+    document.querySelector("#viewbox_report")
+  );
+}
+
+function createBilibiliButton() {
+  const button = document.createElement("button");
+  button.id = BILIBILI_BUTTON_ID;
+  button.type = "button";
+  button.setAttribute("aria-label", "Open YouTube Digest");
+  button.innerHTML = `<span class="ytd-bilibili-digest-label">Digest</span>`;
+
+  // A quiet pill that sits comfortably beside Bilibili's own toolbar items.
+  button.style.cssText = `
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+    padding: 0 16px;
+    height: 28px;
+    border: none;
+    border-radius: 14px;
+    background: #c8674f;
+    color: white;
+    font-family: system-ui, -apple-system, "PingFang SC", "Microsoft YaHei", sans-serif;
+    font-size: 13px;
+    font-weight: 600;
+    cursor: pointer;
+    margin-right: 12px;
+    transition: background 0.2s, transform 0.1s;
+    flex: 0 0 auto;
+    align-self: center;
+    white-space: nowrap;
+  `;
+
+  button.addEventListener("mouseenter", () => {
+    button.style.background = "#b25742";
+    button.style.transform = "scale(1.03)";
+  });
+  button.addEventListener("mouseleave", () => {
+    button.style.background = "#c8674f";
+    button.style.transform = "scale(1)";
+  });
+
+  button.addEventListener("click", (e) => {
+    e.preventDefault();
+    e.stopPropagation();
+    // Fire the open request directly from the click handler — awaiting
+    // anything first could expire Chrome's user-gesture requirement for
+    // sidePanel.open().
+    try {
+      const sent = chrome.runtime.sendMessage({
+        action: "bilibiliOpenSidePanel",
+        requestId: createBilibiliRequestId(),
+      });
+      Promise.resolve(sent).catch(() => {});
+    } catch (error) {
+      console.error("[YouTube Digest] Failed to open side panel:", error);
+    }
+  });
+
+  bilibiliDigestButton = button;
+  return button;
+}
+
+/**
+ * Reconciles the Digest button with the current toolbar. Idempotent: safe to
+ * call from the observer, the fingerprint tick, and navigation handling.
+ */
+function injectBilibiliButton() {
+  const existingButtons = Array.from(
+    document.querySelectorAll(`#${BILIBILI_BUTTON_ID}`),
+  );
+
+  if (!isBilibiliVideoPage()) {
+    existingButtons.forEach((button) => button.remove());
+    bilibiliDigestButton = null;
+    return false;
+  }
+
+  const host = findBilibiliButtonHost();
+  if (!host) {
+    debugLog("[YouTube Digest Content] Bilibili toolbar not found yet");
+    return false;
+  }
+
+  let button = existingButtons.find(
+    (candidate) => candidate === bilibiliDigestButton,
+  );
+  if (!button) {
+    existingButtons.forEach((candidate) => candidate.remove());
+    button = createBilibiliButton();
+  }
+  existingButtons.forEach((candidate) => {
+    if (candidate !== button) candidate.remove();
+  });
+
+  if (button.parentElement !== host) {
+    host.appendChild(button);
+  }
+  return true;
+}
+
+/**
+ * Watches a LOCAL subtree (the left column that contains the toolbar) so a
+ * rebuilt toolbar gets its button back. We deliberately never observe
+ * document.body: the danmaku list and comments churn constantly and would
+ * fire this observer in a storm.
+ */
+function setupBilibiliButtonObserver() {
+  if (bilibiliButtonObserver) return;
+
+  const observeTarget =
+    document.querySelector(".left-container") ||
+    document.querySelector("#mirror-vdcon");
+  if (!observeTarget) return; // Retried by the next fingerprint tick.
+
+  bilibiliButtonObserver = new MutationObserver(() => {
+    if (!bilibiliActive) return;
+    const host = findBilibiliButtonHost();
+    if (
+      !bilibiliDigestButton ||
+      !bilibiliDigestButton.isConnected ||
+      (host && bilibiliDigestButton.parentElement !== host)
+    ) {
+      injectBilibiliButton();
+    }
+  });
+  bilibiliButtonObserver.observe(observeTarget, {
+    childList: true,
+    subtree: true,
+  });
+}
+
+// ------------------------------------------------------------
+// MAIN-world bridge (read-only, one request in flight, 2s timeout)
+// ------------------------------------------------------------
+
+/**
+ * Asks bilibili-page.js (MAIN world) for the whitelisted page state. Resolves
+ * to null on timeout or when a read is already in flight — callers then fall
+ * back to URL + DOM metadata. At most one read is ever in flight.
+ */
+function requestBilibiliMainState() {
+  if (bilibiliBridgePending) return bilibiliBridgePending.promise;
+
+  const requestId = createBilibiliRequestId();
+  let resolvePromise;
+  const promise = new Promise((resolve) => {
+    resolvePromise = resolve;
+  });
+
+  const timerId = setTimeout(() => {
+    if (bilibiliBridgePending?.requestId === requestId) {
+      bilibiliBridgePending = null;
+      resolvePromise(null);
+    }
+  }, BILIBILI_BRIDGE_TIMEOUT_MS);
+
+  bilibiliBridgePending = { requestId, resolve: resolvePromise, timerId, promise };
+
+  try {
+    window.postMessage(
+      {
+        channel: BILIBILI_BRIDGE_CHANNEL,
+        type: "read-state",
+        requestId,
+      },
+      window.location.origin,
+    );
+  } catch (error) {
+    clearTimeout(timerId);
+    bilibiliBridgePending = null;
+    resolvePromise(null);
+  }
+
+  return promise;
+}
+
+/**
+ * Validates an incoming bridge message strictly: same window, exact origin,
+ * our channel, the "state" response type, and the in-flight requestId. The
+ * page can post arbitrary messages, so anything off is ignored.
+ */
+function handleBilibiliBridgeMessage(event) {
+  const pending = bilibiliBridgePending;
+  if (!pending) return;
+  if (event.source !== window) return;
+  if (event.origin !== window.location.origin) return;
+
+  const data = event.data;
+  if (!data || typeof data !== "object") return;
+  if (data.channel !== BILIBILI_BRIDGE_CHANNEL) return;
+  if (data.type !== "state") return;
+  if (data.requestId !== pending.requestId) return;
+
+  bilibiliBridgePending = null;
+  clearTimeout(pending.timerId);
+  pending.resolve(sanitizeBilibiliMainState(data));
+}
+
+/**
+ * Keeps only the whitelisted fields with strict types. The MAIN world is
+ * page-influenced, so its answer is treated as untrusted input.
+ */
+function sanitizeBilibiliMainState(data) {
+  const cleanString = (value, max) =>
+    typeof value === "string" && value.trim()
+      ? value.trim().slice(0, max)
+      : null;
+  const idString = (value) =>
+    typeof value === "string" && /^[1-9]\d*$/.test(value) ? value : null;
+
+  return {
+    available: data.available === true,
+    stateMatched: data.stateMatched === true,
+    bvid:
+      typeof data.bvid === "string" && BILIBILI_BV_PATTERN.test(data.bvid)
+        ? data.bvid
+        : null,
+    aid: idString(data.aid),
+    page: Number.isInteger(data.page) && data.page > 0 ? data.page : null,
+    cidHint: idString(data.cidHint),
+    title: cleanString(data.title, 500),
+    channelName: cleanString(data.channelName, 300),
+    description: cleanString(data.description, 5000),
+    duration:
+      Number.isFinite(data.duration) && data.duration > 0
+        ? data.duration
+        : null,
+  };
+}
+
+// ------------------------------------------------------------
+// Page info assembly (URL identity + MAIN hints + DOM fallback)
+// ------------------------------------------------------------
+
+/**
+ * Best-effort DOM metadata for when the MAIN bridge is missing or its state
+ * is stale. These are hints for the panel header; identity always comes from
+ * the URL, and the background view API is the final authority.
+ */
+function readBilibiliDomMetadata() {
+  const titleEl = document.querySelector(
+    "#viewbox_report h1.video-title, h1.video-title",
+  );
+  const channelEl = document.querySelector(
+    ".up-info-container .up-name, .up-detail-top .up-name, .up-name",
+  );
+  const descEl = document.querySelector("#v_desc .desc-info-text, #v_desc");
+  const video = findBilibiliPlayerVideo();
+  const duration =
+    video && Number.isFinite(video.duration) && video.duration > 0
+      ? video.duration
+      : null;
+
+  return {
+    title: titleEl?.textContent?.trim() || null,
+    channelName: channelEl?.textContent?.trim() || null,
+    description: descEl?.textContent?.trim() || null,
+    duration,
+  };
+}
+
+/**
+ * Answers the relayed bilibiliGetPageInfo request. Identity (bvid/aid/page)
+ * always comes from the URL. The MAIN state contributes title/channel/cid
+ * only when it still matches the URL — a stale __INITIAL_STATE__ must not
+ * speak for the current video.
+ */
+async function getBilibiliPageInfo() {
+  const locator = getCurrentBilibiliLocator();
+  if (!locator) {
+    return {
+      success: false,
+      error: {
+        code: "UNSUPPORTED_PAGE",
+        message: "This is not a supported Bilibili video page.",
+        retryable: false,
+      },
+    };
+  }
+
+  const state = await requestBilibiliMainState();
+  const dom = readBilibiliDomMetadata();
+
+  let cidHint = null;
+  let title = dom.title;
+  let channelName = dom.channelName;
+  let description = dom.description;
+  let duration = dom.duration;
+  let stateMatched = false;
+
+  if (state && state.available && state.stateMatched) {
+    const identityMatches =
+      (locator.bvid && state.bvid === locator.bvid) ||
+      (!locator.bvid && locator.aid && state.aid === locator.aid);
+    if (identityMatches) {
+      stateMatched = true;
+      cidHint = state.cidHint;
+      title = state.title || title;
+      channelName = state.channelName || channelName;
+      description = state.description || description;
+      duration = state.duration || duration;
+    }
+  }
+
+  return {
+    success: true,
+    locator: serializeBilibiliLocator({
+      bvid: locator.bvid,
+      aid: locator.aid,
+      page: locator.page,
+      cidHint,
+    }),
+    title: title || "",
+    channelName: channelName || "",
+    description: description || "",
+    duration: duration || 0,
+    stateMatched,
+  };
+}
+
+// ------------------------------------------------------------
+// Player reads and timestamp seeks
+// ------------------------------------------------------------
+
+/**
+ * The SSR HTML ships an empty #bilibili-player div; the <video> element only
+ * appears after the player hydrates. Keep the selector loose so player DOM
+ * reshuffles do not break us.
+ */
+function findBilibiliPlayerVideo() {
+  return (
+    document.querySelector("#bilibili-player video") ||
+    document.querySelector("#playerWrap video") ||
+    document.querySelector(".bpx-player-video-wrap video")
+  );
+}
+
+function cancelBilibiliPlayerWait() {
+  // Settle any in-flight hydration wait so its async sendResponse always
+  // fires exactly once. The callback re-validates identity, so a navigation
+  // cancel surfaces as STALE_CONTEXT instead of a hung relay.
+  const settle = bilibiliPlayerWaitSettle;
+  bilibiliPlayerWaitSettle = null;
+  if (bilibiliPlayerObserver) {
+    bilibiliPlayerObserver.disconnect();
+    bilibiliPlayerObserver = null;
+  }
+  if (bilibiliPlayerWaitTimer) {
+    clearTimeout(bilibiliPlayerWaitTimer);
+    bilibiliPlayerWaitTimer = null;
+  }
+  if (settle) settle(null);
+}
+
+/**
+ * Waits (bounded) for the hydrated player video element. Watches only the
+ * player container subtree. Calls back with null on timeout or when the wait
+ * is cancelled (e.g. the page navigated to another video/part).
+ */
+function waitForBilibiliPlayerVideo(
+  callback,
+  timeoutMs = BILIBILI_PLAYER_WAIT_TIMEOUT_MS,
+) {
+  cancelBilibiliPlayerWait(); // settles any previous wait as timed out
+
+  let settled = false;
+  const finish = (video) => {
+    if (settled) return;
+    settled = true;
+    if (bilibiliPlayerWaitSettle === finish) bilibiliPlayerWaitSettle = null;
+    cancelBilibiliPlayerWait();
+    callback(video || null);
+  };
+  bilibiliPlayerWaitSettle = finish;
+
+  const immediate = findBilibiliPlayerVideo();
+  if (immediate) {
+    finish(immediate);
+    return;
+  }
+
+  const host =
+    document.querySelector("#bilibili-player") ||
+    document.querySelector("#playerWrap");
+  if (host) {
+    bilibiliPlayerObserver = new MutationObserver(() => {
+      const video = findBilibiliPlayerVideo();
+      if (video) finish(video);
+    });
+    bilibiliPlayerObserver.observe(host, { childList: true, subtree: true });
+  }
+
+  bilibiliPlayerWaitTimer = setTimeout(
+    () => finish(findBilibiliPlayerVideo()),
+    timeoutMs,
+  );
+}
+
+/**
+ * The background sends its authoritative video object with player requests.
+ * We still check it against the address bar: bvid (or aid for av URLs) and
+ * the part number must match, otherwise the request belongs to a previous
+ * video/part and is refused as STALE_CONTEXT.
+ */
+function bilibiliVideoMatchesPage(video) {
+  if (!video || typeof video !== "object") return false;
+  const locator = getCurrentBilibiliLocator();
+  if (!locator) return false;
+
+  const videoBvid =
+    typeof video.bvid === "string" && BILIBILI_BV_PATTERN.test(video.bvid)
+      ? video.bvid
+      : null;
+  const videoAid =
+    typeof video.aid === "string" && /^[1-9]\d*$/.test(video.aid)
+      ? video.aid
+      : null;
+  const videoPage =
+    Number.isInteger(video.page) && video.page > 0 ? video.page : null;
+
+  if (locator.bvid) {
+    if (!videoBvid || videoBvid !== locator.bvid) return false;
+  } else if (locator.aid) {
+    if (!videoAid || videoAid !== locator.aid) return false;
+  } else {
+    return false;
+  }
+
+  return videoPage !== null && videoPage === locator.page;
+}
+
+function bilibiliContentError(code, message, retryable) {
+  return { success: false, error: { code, message, retryable } };
+}
+
+function handleBilibiliGetCurrentTime(message) {
+  if (!isBilibiliVideoPage()) {
+    return bilibiliContentError(
+      "UNSUPPORTED_PAGE",
+      "This is not a supported Bilibili video page.",
+      false,
+    );
+  }
+  if (!bilibiliVideoMatchesPage(message?.video)) {
+    return bilibiliContentError(
+      "STALE_CONTEXT",
+      "The player request belongs to a different video or part.",
+      false,
+    );
+  }
+  const video = findBilibiliPlayerVideo();
+  if (!video) {
+    return bilibiliContentError(
+      "PLAYER_NOT_READY",
+      "The player is still loading.",
+      true,
+    );
+  }
+  return {
+    success: true,
+    currentTime: Number.isFinite(video.currentTime) ? video.currentTime : 0,
+    paused: video.paused !== false,
+  };
+}
+
+/**
+ * Seeks after validating identity and the seconds value. If the player has
+ * not hydrated yet, waits briefly (bounded) before reporting
+ * PLAYER_NOT_READY — we never pretend a missing player is a successful seek
+ * or a valid 0-second position.
+ */
+function handleBilibiliSeekTo(message, sendResponse) {
+  const fail = (code, text, retryable) => {
+    sendResponse(bilibiliContentError(code, text, retryable));
+    return false;
+  };
+
+  if (!isBilibiliVideoPage()) {
+    return fail(
+      "UNSUPPORTED_PAGE",
+      "This is not a supported Bilibili video page.",
+      false,
+    );
+  }
+  if (!bilibiliVideoMatchesPage(message?.video)) {
+    return fail(
+      "STALE_CONTEXT",
+      "The seek request belongs to a different video or part.",
+      false,
+    );
+  }
+
+  const seconds = Number(message.seconds);
+  if (!Number.isFinite(seconds) || seconds < 0) {
+    return fail(
+      "INVALID_REQUEST",
+      "Seek position must be a finite, non-negative number of seconds.",
+      false,
+    );
+  }
+
+  const video = findBilibiliPlayerVideo();
+  if (video) {
+    sendResponse(applyBilibiliSeek(video, seconds));
+    return false;
+  }
+
+  waitForBilibiliPlayerVideo((found) => {
+    // Navigation may have moved to another video/part while we waited for
+    // hydration: re-validate against the address bar BEFORE touching the
+    // player, so a stale wait can never seek the new part to the old
+    // timestamp or report a fake success.
+    if (!isBilibiliVideoPage() || !bilibiliVideoMatchesPage(message.video)) {
+      sendResponse(
+        bilibiliContentError(
+          "STALE_CONTEXT",
+          "The seek request belongs to a different video or part.",
+          false,
+        ),
+      );
+      return;
+    }
+    if (!found) {
+      sendResponse(
+        bilibiliContentError(
+          "PLAYER_NOT_READY",
+          "The player is still loading. Try again in a moment.",
+          true,
+        ),
+      );
+      return;
+    }
+    sendResponse(applyBilibiliSeek(found, seconds));
+  });
+  return true; // Async response while we wait for hydration
+}
+
+function applyBilibiliSeek(video, seconds) {
+  let target = seconds;
+  if (Number.isFinite(video.duration) && video.duration > 0) {
+    target = Math.min(seconds, video.duration);
+  }
+  try {
+    video.currentTime = target;
+    if (video.paused) {
+      const played = video.play?.();
+      played?.catch?.(() => {}); // Autoplay policies may reject — harmless.
+    }
+  } catch (error) {
+    return bilibiliContentError(
+      "PLAYER_NOT_READY",
+      "Could not seek the player.",
+      true,
+    );
+  }
+  return { success: true };
+}
+
+// Persistent listeners let the script survive SPA trips away from and back
+// to video pages. Registration is host-gated so YouTube pages never see them.
+if (isBilibiliHost()) {
+  addBilibiliPersistentListeners();
+}
+
+// Helpers are exposed for the repository's Node tests. The page does not
+// read this object at runtime.
+globalThis.__YTD_BILIBILI_CONTENT_TESTING__ = {
+  isBilibiliHost,
+  isBilibiliVideoPage,
+  parseBilibiliLocatorFromUrl,
+  computeBilibiliFingerprint,
+  serializeBilibiliLocator,
+  initBilibili,
+  cleanupBilibili,
+  handleBilibiliPopstate,
+  bilibiliFingerprintTick,
+  handleBilibiliNavigation,
+  findBilibiliButtonHost,
+  injectBilibiliButton,
+  setupBilibiliButtonObserver,
+  requestBilibiliMainState,
+  handleBilibiliBridgeMessage,
+  sanitizeBilibiliMainState,
+  readBilibiliDomMetadata,
+  getBilibiliPageInfo,
+  findBilibiliPlayerVideo,
+  waitForBilibiliPlayerVideo,
+  cancelBilibiliPlayerWait,
+  bilibiliVideoMatchesPage,
+  handleBilibiliGetCurrentTime,
+  handleBilibiliSeekTo,
+  applyBilibiliSeek,
+  getBilibiliState() {
+    return {
+      active: bilibiliActive,
+      lastFingerprint: bilibiliLastFingerprint,
+      hasFingerprintTimer: bilibiliFingerprintTimer !== null,
+      hasButtonObserver: bilibiliButtonObserver !== null,
+      hasPlayerObserver: bilibiliPlayerObserver !== null,
+      hasBridgePending: bilibiliBridgePending !== null,
+      button: bilibiliDigestButton,
+    };
+  },
+};

@@ -23,3 +23,13 @@ dist/
 .env.*
 *.pem
 *.key
+
+# Internal working files (not published)
+AGENTS.md
+docs/
+TASK*.md
+PLAN-REQUEST.md
+REVIEW-REQUEST.md
+.tmp/
+.tmp-*
+HANDOFF.md

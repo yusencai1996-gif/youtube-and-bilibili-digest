@@ -31,7 +31,7 @@ test("release copy documents current scope without em dashes", () => {
   assert.doesNotMatch(manifest.description, /—/);
   assert.doesNotMatch(packageJson.description, /—/);
 
-  assert.equal(manifest.name, "YouTube Digest");
+  assert.equal(manifest.name, "daweige digest");
   assert.equal(packageJson.name, "youtube-digest");
   assert.match(read("scripts/package-extension.sh"), /youtube-digest-v\$version\.zip/);
   assert.doesNotMatch(

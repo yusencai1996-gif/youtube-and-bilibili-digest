@@ -29,6 +29,38 @@ let isAnalysisLoading = false; // Track if analysis is in progress
 let youtubeTabId = null; // Store the YouTube tab ID for reliable messaging
 let errorAction = null;
 
+// --- Bilibili platform state ---
+// Bilibili uses the same UI with a different message protocol. currentVideoId
+// holds the resolved videoKey ("bilibili:BV...:cid"), so the existing cache,
+// language-mode, reading-position, and note keys stay isolated per platform
+// and per video part automatically.
+const BILIBILI_BV_PATTERN = /^BV1[1-9A-HJ-NP-Za-km-z]{9}$/;
+const BILIBILI_AV_PATTERN = /^av([1-9]\d*)$/i;
+const BILIBILI_PARTIAL_CACHE_MS = 5 * 60 * 1000; // Partial subtitles refetch after 5 min
+let currentPlatform = null; // "youtube" | "bilibili"
+let bilibiliTabId = null;
+let currentBilibiliVideo = null; // Authoritative video object from resolveBilibiliVideo
+let currentBilibiliLocator = null; // URL identity the current digest started from
+let currentBilibiliFingerprint = null;
+let currentTranscriptSource = null; // "cc" | "ai" | "conclusion" | null
+let currentOriginalAvailable = true;
+let currentCoverage = null;
+// Set ONLY when a transcript is actually fetched or restored from cache —
+// never when analysis/translation re-saves the entry. The partial-subtitle
+// expiry reads this clock; the shared `timestamp` gets rewritten by every
+// cache save and would otherwise keep stale partial subtitles alive forever.
+let currentTranscriptFetchedAt = null;
+let bilibiliRequestGeneration = 0; // Invalidates stale async bilibili results
+// Panel-wide content epoch: every content (re)load — YouTube or Bilibili,
+// navigation or refresh — bumps it. Async work (analysis, explanation,
+// notes, transcript fetches) snapshots the epoch together with
+// platform/tab/videoKey before its first await and applies results only
+// while the snapshot still matches, so a late answer from a previous
+// video/part/platform can never pollute the current view or its cache.
+let panelContentEpoch = 0;
+let lastKnownConfig = null; // { hasSupadataKey, hasAiKey }
+let rateLimitCooldownTimer = null;
+
 // --- Translation state ---
 // The universal language control supports original content, Chinese, and an
 // aligned bilingual view across Transcript, Overview, and Notes.
@@ -257,15 +289,22 @@ document.addEventListener("DOMContentLoaded", async () => {
   setupEventListeners();
   await evictOldCacheEntries(20);
 
-  const configStatus = await chrome.runtime.sendMessage({
-    action: "checkConfig",
-  });
-
-  if (!configStatus.hasSupadataKey || !configStatus.hasAiKey) {
-    showConfigError(configStatus);
-    return;
+  try {
+    const configStatus = await chrome.runtime.sendMessage({
+      action: "checkConfig",
+    });
+    lastKnownConfig = {
+      hasSupadataKey: !!configStatus?.hasSupadataKey,
+      hasAiKey: !!configStatus?.hasAiKey,
+    };
+  } catch (error) {
+    console.error("[YouTube Digest Panel] checkConfig failed:", error);
+    lastKnownConfig = null;
   }
 
+  // The configuration gate lives inside checkCurrentTab: YouTube still
+  // requires both keys, while Bilibili transcripts work keyless and check
+  // for the DeepSeek key only when an AI feature is actually used.
   await checkCurrentTab();
 });
 
@@ -290,6 +329,21 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
       .getElementById("notesFilterAll")
       ?.classList.contains("active");
     loadNotes(filterAll ? null : currentVideoId);
+    sendResponse({ success: true });
+  }
+  if (message.action === "bilibiliPanelOpened") {
+    // The background tells us a Bilibili page opened this panel. Only react
+    // to events for our own window; a cold-starting panel checks the current
+    // tab itself and never depends on receiving this event.
+    if (
+      panelWindowId !== null &&
+      message.windowId !== undefined &&
+      message.windowId !== panelWindowId
+    ) {
+      sendResponse({ success: false });
+      return false;
+    }
+    checkCurrentTab();
     sendResponse({ success: true });
   }
   return false;
@@ -335,10 +389,23 @@ function panelIsShowingResults() {
 }
 
 /**
- * Reacts to the URL now in front of the panel: close on non-YouTube,
- * refresh the digest when the video changed.
+ * Reacts to the URL now in front of the panel: close on unsupported pages,
+ * refresh the digest when the video (or Bilibili part) changed.
  */
 function handleFrontTabUrl(url) {
+  const biliLocator = parseBilibiliVideoUrl(url);
+  if (biliLocator) {
+    const fingerprint = bilibiliLocatorFingerprint(biliLocator);
+    if (
+      fingerprint !== currentBilibiliFingerprint ||
+      currentPlatform !== "bilibili" ||
+      !panelIsShowingResults()
+    ) {
+      scheduleDigestRefresh();
+    }
+    return;
+  }
+
   if (!(url || "").startsWith("https://www.youtube.com")) {
     // Start the position save, then close in this same event callback. Chrome
     // does not reliably honor window.close() after an asynchronous wait.
@@ -403,6 +470,12 @@ function setupEventListeners() {
   document.getElementById("errorBtn").addEventListener("click", () => {
     if (errorAction) {
       errorAction();
+      return;
+    }
+    if (currentPlatform === "bilibili") {
+      // Bilibili errors always re-resolve through the tab; the YouTube retry
+      // path below would misread a bilibili videoKey as a YouTube ID.
+      checkCurrentTab();
       return;
     }
     if (currentVideoId) {
@@ -475,8 +548,8 @@ function setNotesFilter(showAll) {
 async function checkCurrentTab() {
   try {
     // The panel belongs only to the active tab. Looking for another open
-    // YouTube tab here can keep an old transcript visible on a non-YouTube
-    // page, so never fall back to background tabs.
+    // video tab here can keep an old transcript visible on an unrelated page,
+    // so never fall back to background tabs — on either platform.
     const tabs = await chrome.tabs.query({
       active: true,
       lastFocusedWindow: true,
@@ -490,10 +563,36 @@ async function checkCurrentTab() {
       return;
     }
 
+    const biliLocator = parseBilibiliVideoUrl(tab.url);
+    if (biliLocator) {
+      // Bilibili: transcripts work without any API key. AI features check
+      // for the DeepSeek key when they are actually used.
+      currentPlatform = "bilibili";
+      bilibiliTabId = tab.id;
+      youtubeTabId = null;
+      currentBilibiliFingerprint = bilibiliLocatorFingerprint(biliLocator);
+      await startBilibiliDigest(biliLocator, tab.url);
+      return;
+    }
+
     if (!tab.url.startsWith("https://www.youtube.com")) {
       handleFrontTabUrl(tab.url);
       return;
     }
+
+    // YouTube keeps its original configuration gate: both keys required.
+    if (!lastKnownConfig?.hasSupadataKey || !lastKnownConfig?.hasAiKey) {
+      showConfigError(
+        lastKnownConfig || { hasSupadataKey: false, hasAiKey: false },
+      );
+      return;
+    }
+
+    currentPlatform = "youtube";
+    bilibiliTabId = null;
+    currentBilibiliVideo = null;
+    currentBilibiliLocator = null;
+    currentBilibiliFingerprint = null;
 
     // Store the tab ID for reliable messaging later
     youtubeTabId = tab.id;
@@ -524,7 +623,7 @@ async function checkCurrentTab() {
         currentVideoDuration = 0;
       }
 
-      startDigest(videoId, tab.url);
+      await startDigest(videoId, tab.url);
     } else {
       showState("welcome");
     }
@@ -560,10 +659,699 @@ function extractVideoId(url) {
 }
 
 // ============================================================
+// BILIBILI DIGEST PIPELINE
+// ============================================================
+
+/**
+ * Parses the video identity out of a Bilibili URL. Only the pathname and the
+ * "p" parameter identify the video; tracking parameters and "t" are ignored.
+ * The background worker re-validates everything — this is request routing.
+ */
+function parseBilibiliVideoUrl(url) {
+  let urlObj;
+  try {
+    urlObj = new URL(url);
+  } catch {
+    return null;
+  }
+  if (urlObj.hostname !== "www.bilibili.com") return null;
+
+  const match = urlObj.pathname.match(/^\/video\/([^/]+)\/?$/);
+  if (!match) return null;
+
+  const segment = match[1];
+  let bvid = null;
+  let aid = null;
+  if (BILIBILI_BV_PATTERN.test(segment)) {
+    bvid = segment;
+  } else {
+    const avMatch = segment.match(BILIBILI_AV_PATTERN);
+    if (avMatch) aid = avMatch[1];
+  }
+  if (!bvid && !aid) return null;
+
+  let page = 1;
+  const rawPage = urlObj.searchParams.get("p");
+  if (rawPage !== null) {
+    if (!/^[1-9]\d*$/.test(rawPage)) return null;
+    page = Number(rawPage);
+  }
+
+  return { bvid, aid, page };
+}
+
+function bilibiliLocatorFingerprint(locator) {
+  if (!locator) return null;
+  return `${locator.bvid || `av${locator.aid}`}|p${locator.page}`;
+}
+
+/**
+ * Wire form of a locator. The background validator accepts only ABSENT
+ * fields — an explicit null is INVALID_REQUEST — so a BV address sends
+ * {bvid, page} and an av address sends {aid, page}, never the null twin.
+ */
+function serializeBilibiliLocator(locator) {
+  const out = {};
+  if (locator.bvid !== null && locator.bvid !== undefined) {
+    out.bvid = locator.bvid;
+  }
+  if (locator.aid !== null && locator.aid !== undefined) {
+    out.aid = locator.aid;
+  }
+  out.page = locator.page;
+  return out;
+}
+
+function createBilibiliRequestId() {
+  return `bili-${Date.now()}-${Math.random().toString(36).slice(2, 10)}`;
+}
+
+/**
+ * Resets the Bilibili-specific transcript metadata. Called on the YouTube
+ * path so a previous Bilibili video's source badge or disabled language
+ * modes can never leak across platforms.
+ */
+function resetTranscriptSourceState() {
+  currentTranscriptSource = null;
+  currentOriginalAvailable = true;
+  currentCoverage = null;
+  document.getElementById("transcriptSourceBadge")?.remove();
+  document.querySelectorAll(".transcript-mode-btn").forEach((button) => {
+    button.disabled = false;
+    button.removeAttribute?.("aria-disabled");
+    button.title = "";
+  });
+}
+
+/**
+ * Snapshots the async context: content epoch + platform + tab + the videoKey
+ * currently shown. PLAN requires every async result to be checked against the
+ * current context before it is applied.
+ */
+function capturePanelAsyncContext() {
+  return {
+    epoch: panelContentEpoch,
+    platform: currentPlatform,
+    tabId: currentPlatform === "bilibili" ? bilibiliTabId : youtubeTabId,
+    videoId: currentVideoId,
+  };
+}
+
+/**
+ * Full match — for post-load async work (analysis, explanation, notes): the
+ * same video must still be on screen.
+ */
+function panelAsyncContextCurrent(ctx) {
+  return (
+    panelFlowContextCurrent(ctx) && ctx.videoId === currentVideoId
+  );
+}
+
+/**
+ * Flow match — for the loading flows themselves, which have not assigned the
+ * new currentVideoId yet: epoch + platform + tab discriminate superseded
+ * loads (a newer navigation/refresh always bumps the epoch first).
+ */
+function panelFlowContextCurrent(ctx) {
+  if (!ctx) return false;
+  const expectedTab =
+    ctx.platform === "bilibili" ? bilibiliTabId : youtubeTabId;
+  return (
+    ctx.epoch === panelContentEpoch &&
+    ctx.platform === currentPlatform &&
+    ctx.tabId === expectedTab
+  );
+}
+
+/**
+ * The Bilibili loading flow: resolve the URL identity into the authoritative
+ * video object first, THEN read the cache by videoKey, then fetch. Resolving
+ * first guarantees a previous part's cache can never leak into this part.
+ */
+async function startBilibiliDigest(locator, tabUrl, { forceRefresh = false } = {}) {
+  const generation = ++bilibiliRequestGeneration;
+  panelContentEpoch += 1; // invalidates analysis/notes/explain from old content
+  const requestTabId = bilibiliTabId;
+  const isStale = () =>
+    generation !== bilibiliRequestGeneration ||
+    currentPlatform !== "bilibili";
+
+  showState("loading");
+  updateLoading("Fetching transcript", "Resolving Bilibili video...");
+
+  let resolveResult;
+  try {
+    resolveResult = await chrome.runtime.sendMessage({
+      action: "resolveBilibiliVideo",
+      requestId: createBilibiliRequestId(),
+      tabId: requestTabId,
+      locator: serializeBilibiliLocator(locator),
+    });
+  } catch (error) {
+    if (isStale()) return;
+    showError(
+      "Could not reach the page",
+      "Reload the Bilibili tab and try again.",
+    );
+    errorAction = () => checkCurrentTab();
+    return;
+  }
+  if (isStale()) return; // A newer navigation superseded this request.
+
+  if (!resolveResult?.success || !resolveResult.video?.videoKey) {
+    handleBilibiliMessageError(resolveResult?.error, { locator, tabUrl });
+    return;
+  }
+
+  const video = resolveResult.video;
+  const videoChanged = video.videoKey !== currentVideoId;
+
+  // Every video change invalidates observer work and in-flight translations.
+  if (videoChanged) {
+    translationGeneration += 1;
+    if (transcriptScrollObserver) transcriptScrollObserver.disconnect();
+    transcriptScrollObserver = null;
+    resetTranscriptSearch();
+    lastTranscriptScrollTop = 0;
+    pendingTranscriptViewState = await loadTranscriptViewState(video.videoKey);
+    currentTranscriptMode = await loadDisplayLanguageMode(video.videoKey);
+    document
+      .getElementById("contentArea")
+      ?.classList.toggle(
+        "restoring-transcript-view",
+        Boolean(pendingTranscriptViewState),
+      );
+  }
+  if (isStale()) return;
+
+  currentBilibiliVideo = video;
+  currentBilibiliLocator = locator;
+  currentVideoTitle = video.title || "";
+  currentChannelName = video.channelName || "";
+  currentVideoDescription = video.description || "";
+  currentVideoDuration = Number.isFinite(video.duration) ? video.duration : 0;
+
+  // Partial transcripts expire after 5 minutes; complete ones keep the
+  // regular cache lifetime. forceRefresh always goes to the network.
+  const cached = forceRefresh ? null : await loadFromCache(video.videoKey);
+  if (isStale()) return;
+
+  const partialExpired = Boolean(
+    cached?.coverage?.possiblyPartial &&
+      Date.now() - (cached.transcriptFetchedAt || cached.timestamp || 0) >
+        BILIBILI_PARTIAL_CACHE_MS,
+  );
+
+  if (cached && !partialExpired) {
+    debugLog("Loading Bilibili digest from cache:", video.videoKey);
+    currentVideoId = video.videoKey;
+    currentVideoUrl = video.canonicalUrl || tabUrl;
+    currentAnalysis = cached.analysis || null;
+    currentTranscript = cached.transcript;
+    currentTranscriptText = cached.transcriptText;
+    currentTranscriptTimestamped = cached.transcriptTimestamped;
+    currentTranscriptLanguage = cached.transcriptLanguage || null;
+    currentTranscriptSource = cached.source || null;
+    currentOriginalAvailable = cached.originalAvailable !== false;
+    currentCoverage = cached.coverage || null;
+    currentTranscriptFetchedAt =
+      cached.transcriptFetchedAt || cached.timestamp || null;
+    isAnalysisLoading = false;
+
+    if (cached.paragraphCache) {
+      for (const [key, value] of Object.entries(cached.paragraphCache)) {
+        transcriptParagraphCache.set(key, value);
+      }
+    }
+    if (cached.interfaceCache) {
+      for (const [key, value] of Object.entries(cached.interfaceCache)) {
+        interfaceTranslationCache.set(key, value);
+      }
+    }
+
+    showBilibiliVideoHeader();
+    renderTranscript();
+    syncBilibiliLanguageModes();
+    renderTranscriptSourceBadge();
+
+    if (currentAnalysis) {
+      renderAnalysisResults(currentAnalysis);
+      highlightMomentsOnPage(currentAnalysis.keyMoments);
+    }
+
+    showState("results");
+    restorePendingTranscriptViewState(video.videoKey);
+    loadNotes(video.videoKey);
+    setupExplainFeature();
+    if (currentTranscriptMode !== "original") translateTranscript();
+    return;
+  }
+
+  const previousTranscriptText = currentTranscriptText;
+
+  currentVideoId = video.videoKey;
+  currentVideoUrl = video.canonicalUrl || tabUrl;
+  currentAnalysis = null;
+  currentTranscript = null;
+  currentTranscriptText = null;
+  currentTranscriptTimestamped = null;
+  currentTranscriptLanguage = null;
+  currentTranscriptSource = null;
+  currentOriginalAvailable = true;
+  currentCoverage = null;
+  currentTranscriptFetchedAt = null;
+  isAnalysisLoading = false;
+
+  showBilibiliVideoHeader();
+  showState("loading");
+  updateLoading("Fetching transcript", "");
+
+  let fetchResult;
+  try {
+    fetchResult = await chrome.runtime.sendMessage({
+      action: "fetchBilibiliTranscript",
+      requestId: createBilibiliRequestId(),
+      tabId: requestTabId,
+      video,
+      forceRefresh,
+    });
+  } catch (error) {
+    if (isStale()) return;
+    showError(
+      "Could not reach the page",
+      "Reload the Bilibili tab and try again.",
+    );
+    errorAction = () => checkCurrentTab();
+    return;
+  }
+  if (isStale() || currentVideoId !== video.videoKey) return;
+
+  applyBilibiliTranscriptResponse(
+    fetchResult,
+    video,
+    { locator, tabUrl },
+    previousTranscriptText,
+  );
+}
+
+function showBilibiliVideoHeader() {
+  if (!currentVideoTitle && !currentChannelName) return;
+  const videoInfo = document.getElementById("videoInfo");
+  document.getElementById("videoTitle").textContent = currentVideoTitle;
+  document.getElementById("videoChannel").textContent = currentChannelName;
+  videoInfo.style.display = "block";
+}
+
+/**
+ * Applies a fetchBilibiliTranscript response: ready renders, the two empty
+ * states get neutral dedicated UI, and errors go through the frozen error
+ * code table. Async callers check staleness BEFORE calling this.
+ */
+function applyBilibiliTranscriptResponse(result, video, retryCtx, previousText = null) {
+  if (!result || typeof result !== "object") {
+    showError("No response", "The background worker did not answer.");
+    errorAction = () => checkCurrentTab();
+    return;
+  }
+
+  if (result.success === false) {
+    handleBilibiliMessageError(result.error, retryCtx);
+    return;
+  }
+
+  if (result.status === "login-required") {
+    showBilibiliEmptyState(
+      "请先登录 B 站",
+      result.message || "登录 B 站后即可读取该视频的字幕。",
+      "重试",
+      retryCtx,
+    );
+    return;
+  }
+
+  if (result.status === "no-subtitle") {
+    showBilibiliEmptyState(
+      "该视频无字幕",
+      result.message || "这个视频目前没有可用的字幕。",
+      "重新检查",
+      retryCtx,
+    );
+    return;
+  }
+
+  if (result.status !== "ready" || !Array.isArray(result.transcript)) {
+    handleBilibiliMessageError(
+      { code: "INVALID_RESPONSE", message: "Unexpected transcript response." },
+      retryCtx,
+    );
+    return;
+  }
+
+  currentTranscript = result.transcript;
+  currentTranscriptText = result.transcriptText || "";
+  currentTranscriptTimestamped = result.transcriptTextTimestamped || "";
+  currentTranscriptLanguage = result.language || null;
+  currentTranscriptSource = result.source || null;
+  currentOriginalAvailable = result.originalAvailable !== false;
+  currentCoverage = result.coverage || null;
+  currentTranscriptFetchedAt = Date.now();
+
+  // A refresh that changed the text invalidates the old analysis and every
+  // translation: their segment IDs were computed from the previous text.
+  // (previousText is captured before the fresh-path reset clears it.)
+  if (previousText && previousText !== currentTranscriptText) {
+    invalidateBilibiliDerivedCaches(video.videoKey);
+  }
+
+  renderTranscript();
+  syncBilibiliLanguageModes();
+  renderTranscriptSourceBadge();
+  showState("results");
+  restorePendingTranscriptViewState(video.videoKey);
+  loadNotes(video.videoKey);
+  setupExplainFeature();
+  if (currentTranscriptMode !== "original") translateTranscript();
+
+  // Cache body + source + coverage only. Subtitle URLs never enter storage.
+  void saveToCache(video.videoKey);
+}
+
+/**
+ * Neutral empty states (not errors): no subtitles, or login required. Both
+ * offer a manual retry and never spin forever.
+ */
+function showBilibiliEmptyState(title, message, buttonText, retryCtx) {
+  showState("error");
+  document.getElementById("errorTitle").textContent = title;
+  document.getElementById("errorMessage").textContent = message;
+  document.getElementById("errorBtn").textContent = buttonText;
+  errorAction = () => {
+    if (retryCtx?.locator) {
+      startBilibiliDigest(retryCtx.locator, retryCtx.tabUrl);
+    } else {
+      checkCurrentTab();
+    }
+  };
+}
+
+/**
+ * Maps the frozen error codes to UI behavior: unsupported input is explained
+ * without retry, rate limiting shows a cooldown, network problems keep the
+ * page alive with a manual retry, and stale contexts hand back to the
+ * navigation flow.
+ */
+function handleBilibiliMessageError(error, retryCtx = {}) {
+  const code =
+    typeof error === "string" ? error : error?.code || "NETWORK_ERROR";
+  const message =
+    (typeof error === "object" && typeof error?.message === "string"
+      ? error.message
+      : "") || "Something went wrong.";
+
+  const retry = () => {
+    if (retryCtx?.locator) {
+      startBilibiliDigest(retryCtx.locator, retryCtx.tabUrl);
+    } else {
+      checkCurrentTab();
+    }
+  };
+
+  switch (code) {
+    case "STALE_CONTEXT":
+      // The page moved on — drop this request and let the navigation flow
+      // restart from the tab's current URL.
+      scheduleDigestRefresh();
+      return;
+
+    case "RATE_LIMITED": {
+      const waitMs = Number.isFinite(error?.retryAfterMs)
+        ? Math.max(1000, error.retryAfterMs)
+        : 60000;
+      showBilibiliRateLimited(message, waitMs, retry);
+      return;
+    }
+
+    case "VIDEO_UNAVAILABLE":
+      showError("视频不可访问", message || "视频不可访问或无权限观看。");
+      errorAction = retry;
+      return;
+
+    case "UNSUPPORTED_PAGE":
+    case "INVALID_REQUEST":
+    case "PAGE_NOT_FOUND":
+      showError("页面不受支持", message || "这个页面不在支持范围内。");
+      errorAction = () => checkCurrentTab();
+      return;
+
+    case "INVALID_RESPONSE":
+    case "SUBTITLE_MISMATCH":
+      showError(
+        "无法安全读取字幕",
+        message || "B 站返回的字幕数据无法验证，未予显示。",
+      );
+      errorAction = retry;
+      return;
+
+    case "PLAYER_NOT_READY":
+    case "CONTENT_UNAVAILABLE":
+    case "TAB_GONE":
+      showError("页面连接已断开", "请刷新当前 B 站页面后重试。");
+      errorAction = () => checkCurrentTab();
+      return;
+
+    case "TRANSCRIPT_NOT_READY":
+    case "STORAGE_FAILED":
+    case "PANEL_OPEN_FAILED":
+      showError("操作未完成", message);
+      errorAction = retry;
+      return;
+
+    case "NETWORK_ERROR":
+    case "TIMEOUT":
+    case "WBI_KEY_UNAVAILABLE":
+    default:
+      showError("字幕获取失败", message);
+      errorAction = retry;
+      return;
+  }
+}
+
+/**
+ * Rate limiting UI: a cooling hint with a disabled retry button. When the
+ * cooldown ends we only re-enable the button — we never auto-request.
+ */
+function showBilibiliRateLimited(message, waitMs, retry) {
+  showState("error");
+  document.getElementById("errorTitle").textContent = "请求暂时受限";
+  document.getElementById("errorMessage").textContent =
+    message || "B 站请求过于频繁，请稍后再试。";
+  const button = document.getElementById("errorBtn");
+  button.disabled = true;
+  button.textContent = `请等待 ${Math.ceil(waitMs / 1000)} 秒`;
+  errorAction = retry;
+
+  if (rateLimitCooldownTimer) clearTimeout(rateLimitCooldownTimer);
+  rateLimitCooldownTimer = setTimeout(() => {
+    rateLimitCooldownTimer = null;
+    button.disabled = false;
+    button.textContent = "重试";
+  }, waitMs);
+}
+
+/**
+ * Drops the analysis and every cached translation for a video. Used after a
+ * refresh whose transcript text changed: old segment IDs pointed at the
+ * previous text and must not be applied to the new one.
+ */
+function invalidateBilibiliDerivedCaches(videoKey) {
+  currentAnalysis = null;
+  const prefix = `${videoKey}:`;
+  for (const key of [...transcriptParagraphCache.keys()]) {
+    if (key.startsWith(prefix)) transcriptParagraphCache.delete(key);
+  }
+  for (const key of [...interfaceTranslationCache.keys()]) {
+    if (key.startsWith(prefix)) interfaceTranslationCache.delete(key);
+  }
+  for (const key of [...interfaceTranslationFailures]) {
+    if (key.startsWith(prefix)) interfaceTranslationFailures.delete(key);
+  }
+}
+
+function bilibiliSourceLabel(source, originalAvailable) {
+  if (source === "cc") return "来源：B 站 CC 字幕";
+  if (source === "ai") return "来源：B 站 AI 字幕";
+  if (source === "conclusion") {
+    return originalAvailable
+      ? "来源：B 站转写"
+      : "来源：B 站转写 · 未提供外文原文";
+  }
+  return "来源：B 站字幕";
+}
+
+/**
+ * Renders the transcript provenance row: where the subtitles came from, the
+ * "may be incomplete" hint when coverage is partial, and a manual refresh.
+ */
+function renderTranscriptSourceBadge() {
+  document.getElementById("transcriptSourceBadge")?.remove();
+  if (currentPlatform !== "bilibili" || !currentTranscriptSource) return;
+
+  const transcriptList = document.getElementById("transcriptList");
+  const host = transcriptList?.parentElement;
+  if (!transcriptList || !host) return;
+
+  const badge = document.createElement("div");
+  badge.id = "transcriptSourceBadge";
+  badge.className = "transcript-source-badge";
+
+  const label = document.createElement("span");
+  label.className = "transcript-source-label";
+  label.textContent = bilibiliSourceLabel(
+    currentTranscriptSource,
+    currentOriginalAvailable,
+  );
+  badge.appendChild(label);
+
+  // possiblyPartial is a heuristic (tail far from the current part's
+  // duration), not a completeness proof — say so honestly and keep the part
+  // we do have usable.
+  if (currentCoverage?.possiblyPartial) {
+    const hint = document.createElement("span");
+    hint.className = "transcript-partial-hint";
+    hint.textContent = "字幕可能尚未完整，已加载现有部分。";
+    badge.appendChild(hint);
+  }
+
+  const refresh = document.createElement("button");
+  refresh.type = "button";
+  refresh.id = "bilibiliRefreshBtn";
+  refresh.className = "bilibili-refresh-btn";
+  refresh.textContent = "刷新字幕";
+  refresh.addEventListener("click", () => {
+    if (currentBilibiliLocator) {
+      startBilibiliDigest(currentBilibiliLocator, currentVideoUrl, {
+        forceRefresh: true,
+      });
+    }
+  });
+  badge.appendChild(refresh);
+
+  host.insertBefore(badge, transcriptList);
+}
+
+/**
+ * Bilibili ASR (conclusion) transcripts are Chinese-only: there is no foreign
+ * original to align, so 中文/双语 would show two identical Chinese columns.
+ * For those transcripts the extra modes are disabled and the badge explains
+ * why; foreign CC tracks keep all three modes.
+ */
+function syncBilibiliLanguageModes() {
+  const foreignOriginal = currentOriginalAvailable !== false;
+  document.querySelectorAll(".transcript-mode-btn").forEach((button) => {
+    const disable = !foreignOriginal && button.dataset.transcriptMode !== "original";
+    button.disabled = disable;
+    if (disable) {
+      button.title = "B 站转写未提供外文原文，无法进行双语对照";
+      button.setAttribute("aria-disabled", "true");
+    } else {
+      button.title = "";
+      button.removeAttribute?.("aria-disabled");
+    }
+  });
+
+  if (!foreignOriginal && currentTranscriptMode !== "original") {
+    currentTranscriptMode = "original";
+    setTranscriptModeButtons("original");
+    renderTranscript();
+    if (currentAnalysis) renderAnalysisResults(currentAnalysis);
+    if (currentNotes.length) renderNotes(currentNotes, currentNotesFilterVideoId);
+  }
+}
+
+/**
+ * Bilibili AI features need only the DeepSeek key. We re-check live so a key
+ * saved after the panel opened still works.
+ */
+async function ensureBilibiliAiKey() {
+  if (currentPlatform !== "bilibili") return true;
+  if (lastKnownConfig?.hasAiKey) return true;
+  try {
+    const config = await chrome.runtime.sendMessage({ action: "checkConfig" });
+    lastKnownConfig = {
+      hasSupadataKey: !!config?.hasSupadataKey,
+      hasAiKey: !!config?.hasAiKey,
+    };
+  } catch (error) {
+    console.error("[YouTube Digest Panel] checkConfig failed:", error);
+  }
+  return !!lastKnownConfig?.hasAiKey;
+}
+
+/**
+ * Timestamp seek for Bilibili: routed through the background relay with the
+ * authoritative video object so the content script can verify the request
+ * still matches the page (video + part) before touching the player.
+ */
+async function bilibiliSeek(seconds) {
+  if (!currentBilibiliVideo || !bilibiliTabId) return;
+  const value = Number(seconds);
+  if (!Number.isFinite(value)) return;
+
+  try {
+    const result = await chrome.runtime.sendMessage({
+      action: "bilibiliRelayToContent",
+      requestId: createBilibiliRequestId(),
+      tabId: bilibiliTabId,
+      payload: {
+        action: "bilibiliSeekTo",
+        video: currentBilibiliVideo,
+        seconds: Math.max(0, Math.floor(value)),
+      },
+    });
+    debugLog("[YouTube Digest Panel] bilibili seek result:", result);
+  } catch (error) {
+    console.error("[YouTube Digest Panel] bilibili seek error:", error);
+  }
+}
+
+/**
+ * Saves a note for the current Bilibili video part. Selected text is stored
+ * verbatim; timestamp-only notes let the background pull the matching line
+ * from this part's cached transcript. Never fabricates note text.
+ */
+async function saveBilibiliNoteRequest({ timestamp, selectedText }) {
+  if (!currentBilibiliVideo || !bilibiliTabId) {
+    return {
+      success: false,
+      error: { code: "TAB_GONE", message: "No Bilibili tab is connected." },
+    };
+  }
+  const message = {
+    action: "saveBilibiliNote",
+    requestId: createBilibiliRequestId(),
+    tabId: bilibiliTabId,
+    video: currentBilibiliVideo,
+    timestamp: Math.max(0, Math.floor(Number(timestamp) || 0)),
+  };
+  if (typeof selectedText === "string" && selectedText.trim()) {
+    message.selectedText = selectedText;
+  }
+  return chrome.runtime.sendMessage(message);
+}
+
+// ============================================================
 // DIGEST PIPELINE
 // ============================================================
 
 async function startDigest(videoId, videoUrl) {
+  // Every content (re)load invalidates async work started under the old one.
+  panelContentEpoch += 1;
+  const flowCtx = capturePanelAsyncContext();
+
+  // Leaving Bilibili: drop any source badge / disabled language modes a
+  // previous Bilibili transcript left behind before rendering YouTube data.
+  resetTranscriptSourceState();
+
   // Check if we already have this video loaded in memory
   if (videoId === currentVideoId && currentAnalysis) {
     showState("results");
@@ -593,6 +1381,9 @@ async function startDigest(videoId, videoUrl) {
 
   // Check cache for this video
   const cached = await loadFromCache(videoId);
+  // A newer navigation/refresh superseded this load while we awaited —
+  // drop everything instead of writing over the newer video's state.
+  if (!panelFlowContextCurrent(flowCtx)) return;
   if (cached) {
     debugLog("Loading from cache:", videoId);
     currentVideoId = videoId;
@@ -602,6 +1393,8 @@ async function startDigest(videoId, videoUrl) {
     currentTranscriptText = cached.transcriptText;
     currentTranscriptTimestamped = cached.transcriptTimestamped;
     currentTranscriptLanguage = cached.transcriptLanguage || null;
+    currentTranscriptFetchedAt =
+      cached.transcriptFetchedAt || cached.timestamp || null;
     isAnalysisLoading = false;
 
     // Restore semantic-segment translations from persistent storage.
@@ -652,6 +1445,7 @@ async function startDigest(videoId, videoUrl) {
   currentTranscriptText = null;
   currentTranscriptTimestamped = null;
   currentTranscriptLanguage = null;
+  currentTranscriptFetchedAt = null;
   isAnalysisLoading = false;
 
   if (currentVideoTitle || currentChannelName) {
@@ -668,6 +1462,10 @@ async function startDigest(videoId, videoUrl) {
     action: "fetchTranscript",
     videoId: videoId,
   });
+
+  // A slow response must never land after the panel moved on — not even its
+  // error UI or a loading-state cleanup.
+  if (!panelFlowContextCurrent(flowCtx)) return;
 
   if (!transcriptResult.success) {
     if (transcriptResult.error === "NO_SUPADATA_KEY") {
@@ -688,6 +1486,7 @@ async function startDigest(videoId, videoUrl) {
   currentTranscriptText = transcriptResult.transcriptText;
   currentTranscriptTimestamped = transcriptResult.transcriptTextTimestamped;
   currentTranscriptLanguage = transcriptResult.language || null;
+  currentTranscriptFetchedAt = Date.now();
 
   // Render transcript immediately (no LLM needed)
   renderTranscript();
@@ -753,6 +1552,9 @@ function getLocalizedPlainText(text, surface, id) {
 
 async function translateInterfaceSegments(surface, segments, rerender) {
   if (currentTranscriptMode === "original" || !segments.length) return;
+  // Translation is an AI operation — on Bilibili it is the only feature
+  // group that needs a key, so check at action time rather than at startup.
+  if (currentPlatform === "bilibili" && !(await ensureBilibiliAiKey())) return;
   const generation = translationGeneration;
   const videoId = currentVideoId;
   const missing = segments
@@ -986,13 +1788,16 @@ async function saveQuoteAsNote(quote, btn) {
   btn.disabled = true;
 
   try {
-    const result = await chrome.runtime.sendMessage({
-      action: "saveNote",
-      videoId: currentVideoId,
-      timestamp: quote.timestampSeconds,
-      videoTitle: currentVideoTitle,
-      channelName: currentChannelName,
-    });
+    const result =
+      currentPlatform === "bilibili"
+        ? await saveBilibiliNoteRequest({ timestamp: quote.timestampSeconds })
+        : await chrome.runtime.sendMessage({
+            action: "saveNote",
+            videoId: currentVideoId,
+            timestamp: quote.timestampSeconds,
+            videoTitle: currentVideoTitle,
+            channelName: currentChannelName,
+          });
 
     if (result.success) {
       btn.textContent = "Saved";
@@ -1066,9 +1871,6 @@ function renderTranscript() {
   const transcriptList = document.getElementById("transcriptList");
   transcriptList.innerHTML = "";
 
-  const existingBadge = document.getElementById("transcriptSourceBadge");
-  if (existingBadge) existingBadge.remove();
-
   // Group entries using smart sentence-boundary + time-guardrail logic
   const grouped = groupTranscriptEntries(currentTranscript);
 
@@ -1091,6 +1893,11 @@ function renderTranscript() {
     );
     transcriptList.appendChild(div);
   });
+
+  // The provenance row is independent of the row repaint: every repaint path
+  // restores it (a no-op outside Bilibili), so switching language modes can
+  // never make the source/partial hint/refresh button vanish.
+  renderTranscriptSourceBadge();
 
   // Reapply an active query after a language mode rerenders the transcript.
   refreshTranscriptSearch({ preserveIndex: false, scroll: false });
@@ -1351,7 +2158,12 @@ function copyTranscript() {
 
 function exportTranscript() {
   const transcriptContent = getDisplayedTranscriptText();
-  const videoUrl = `https://youtube.com/watch?v=${currentVideoId}`;
+  // Bilibili exports use the canonical BV URL with the current part; YouTube
+  // keeps its original watch URL.
+  const videoUrl =
+    currentPlatform === "bilibili" && currentBilibiliVideo?.canonicalUrl
+      ? currentBilibiliVideo.canonicalUrl
+      : `https://youtube.com/watch?v=${currentVideoId}`;
 
   let exportText = "";
   exportText += `TRANSCRIPT\n`;
@@ -1507,6 +2319,21 @@ async function triggerAnalysis() {
   if (!currentTranscriptTimestamped || isAnalysisLoading || currentAnalysis)
     return;
 
+  // Snapshot before the first await: a late answer from a previous
+  // video/part/platform must never land on the current view or its cache.
+  const ctx = capturePanelAsyncContext();
+
+  // Bilibili transcripts load keyless, but the AI overview needs DeepSeek.
+  if (currentPlatform === "bilibili" && !(await ensureBilibiliAiKey())) {
+    if (!panelAsyncContextCurrent(ctx)) return;
+    const chapterListEl = document.getElementById("chapterList");
+    if (chapterListEl)
+      chapterListEl.innerHTML =
+        '<li class="chapter-item" style="color: var(--accent); border: none;">Add your DeepSeek API key in YouTube Digest Settings to use AI features.</li>';
+    return;
+  }
+  if (!panelAsyncContextCurrent(ctx)) return;
+
   isAnalysisLoading = true;
 
   // Show loading indicators in the Overview tab
@@ -1530,6 +2357,11 @@ async function triggerAnalysis() {
       videoDuration: currentVideoDuration,
     });
 
+    // The user switched video/part/platform (or refreshed) while the model
+    // worked: drop the answer — the newer flow owns the UI, the loading flag,
+    // and the cache.
+    if (!panelAsyncContextCurrent(ctx)) return;
+
     if (!analysisResult.success) {
       if (chapterList)
         chapterList.innerHTML = `<li class="chapter-item" style="color: var(--accent); border: none;">Analysis failed: ${escapeHtml(analysisResult.error || "Unknown error")}</li>`;
@@ -1541,9 +2373,11 @@ async function triggerAnalysis() {
     renderAnalysisResults(currentAnalysis);
     highlightMomentsOnPage(currentAnalysis.keyMoments);
 
-    // Save to cache now that we have analysis
-    await saveToCache(currentVideoId);
+    // Save to cache now that we have analysis — keyed by the snapshot's
+    // video, so a cross-video race can never write into another video's entry.
+    await saveToCache(ctx.videoId);
   } catch (error) {
+    if (!panelAsyncContextCurrent(ctx)) return;
     console.error("[YouTube Digest Panel] Analysis error:", error);
     if (chapterList)
       chapterList.innerHTML = `<li class="chapter-item" style="color: var(--accent); border: none;">Error: ${escapeHtml(error.message)}</li>`;
@@ -1560,6 +2394,11 @@ async function seekTo(seconds) {
   debugLog("[YouTube Digest Panel] seekTo called with:", seconds);
   if (seconds === undefined || seconds === null) {
     debugLog("[YouTube Digest Panel] seekTo aborted - no seconds value");
+    return;
+  }
+
+  if (currentPlatform === "bilibili") {
+    await bilibiliSeek(seconds);
     return;
   }
 
@@ -1832,14 +2671,20 @@ function setupExplainFeature() {
       button.disabled = true;
 
       try {
-        const result = await chrome.runtime.sendMessage({
-          action: "saveNote",
-          videoId: currentVideoId,
-          timestamp: selectedTimestamp,
-          videoTitle: currentVideoTitle,
-          channelName: currentChannelName,
-          selectedText,
-        });
+        const result =
+          currentPlatform === "bilibili"
+            ? await saveBilibiliNoteRequest({
+                timestamp: selectedTimestamp,
+                selectedText,
+              })
+            : await chrome.runtime.sendMessage({
+                action: "saveNote",
+                videoId: currentVideoId,
+                timestamp: selectedTimestamp,
+                videoTitle: currentVideoTitle,
+                channelName: currentChannelName,
+                selectedText,
+              });
 
         if (!result?.success) {
           throw new Error(result?.error || "Could not save note");
@@ -1867,6 +2712,11 @@ function setupExplainFeature() {
  * Shows the explanation modal and fetches it from the configured AI provider.
  */
 async function showExplanation(selectedText) {
+  // Snapshot before any await: the explanation belongs to the transcript on
+  // screen NOW. If the panel moves to another video/part/platform while the
+  // model works, the late answer must not be written into the modal.
+  const ctx = capturePanelAsyncContext();
+
   // Create modal
   const modal = document.createElement("div");
   modal.id = "explainModal";
@@ -1900,6 +2750,19 @@ async function showExplanation(selectedText) {
   // Get some context around the selection from the transcript
   const transcriptContext = getTranscriptContext(selectedText);
 
+  // Bilibili transcripts load keyless; Explain still needs the DeepSeek key.
+  if (currentPlatform === "bilibili" && !(await ensureBilibiliAiKey())) {
+    if (!panelAsyncContextCurrent(ctx)) {
+      modal.remove();
+      return;
+    }
+    const contentDiv = document.getElementById("explanationContent");
+    if (contentDiv) {
+      contentDiv.innerHTML = `<div class="explain-error">Add your DeepSeek API key in YouTube Digest Settings to use AI features.</div>`;
+    }
+    return;
+  }
+
   // Fetch explanation
   try {
     const result = await chrome.runtime.sendMessage({
@@ -1909,6 +2772,12 @@ async function showExplanation(selectedText) {
       videoTitle: currentVideoTitle,
     });
 
+    // Stale answer for a transcript that is no longer on screen: drop it.
+    if (!panelAsyncContextCurrent(ctx)) {
+      modal.remove();
+      return;
+    }
+
     const contentDiv = document.getElementById("explanationContent");
     if (result.success) {
       contentDiv.innerHTML = `<div class="explain-text">${escapeHtml(result.explanation).replace(/\n\n/g, "</p><p>").replace(/\n/g, "<br>")}</div>`;
@@ -1916,6 +2785,10 @@ async function showExplanation(selectedText) {
       contentDiv.innerHTML = `<div class="explain-error">Failed to get explanation: ${escapeHtml(result.error)}</div>`;
     }
   } catch (error) {
+    if (!panelAsyncContextCurrent(ctx)) {
+      modal.remove();
+      return;
+    }
     const contentDiv = document.getElementById("explanationContent");
     contentDiv.innerHTML = `<div class="explain-error">Error: ${escapeHtml(error.message)}</div>`;
   }
@@ -1971,10 +2844,18 @@ async function saveToCache(videoId) {
       transcriptText: currentTranscriptText,
       transcriptTimestamped: currentTranscriptTimestamped,
       transcriptLanguage: currentTranscriptLanguage,
+      // Bilibili provenance: body + source + coverage only. Subtitle URLs
+      // are never cached.
+      source: currentTranscriptSource,
+      originalAvailable: currentOriginalAvailable,
+      coverage: currentCoverage,
       videoTitle: currentVideoTitle,
       channelName: currentChannelName,
       paragraphCache: paragraphCacheForVideo,
       interfaceCache: interfaceCacheForVideo,
+      // The transcript's own fetch clock: analysis/translation re-saves bump
+      // `timestamp` but must never renew a partial transcript's freshness.
+      transcriptFetchedAt: currentTranscriptFetchedAt ?? Date.now(),
       timestamp: Date.now(),
     };
 
@@ -2079,11 +2960,16 @@ async function updateCache() {
  * @param {string|null} videoId - Filter by video ID, or null for all notes
  */
 async function loadNotes(videoId) {
+  // Snapshot before the await: notes arriving after a video/part/platform
+  // switch belong to the old context and must not be rendered or stored.
+  const ctx = capturePanelAsyncContext();
   try {
     const result = await chrome.runtime.sendMessage({
       action: "getNotes",
       videoId: videoId,
     });
+
+    if (!panelAsyncContextCurrent(ctx)) return;
 
     if (result.success) {
       currentNotes = result.notes || [];
@@ -2277,17 +3163,31 @@ function stopPlaybackTracking() {
  */
 async function playbackTrackingTick() {
   try {
-    const result = await chrome.runtime.sendMessage({
-      action: "relayToContent",
-      payload: { action: "getCurrentTime" },
-    });
+    let result;
+    if (currentPlatform === "bilibili") {
+      if (!currentBilibiliVideo || !bilibiliTabId) return;
+      result = await chrome.runtime.sendMessage({
+        action: "bilibiliRelayToContent",
+        requestId: createBilibiliRequestId(),
+        tabId: bilibiliTabId,
+        payload: {
+          action: "bilibiliGetCurrentTime",
+          video: currentBilibiliVideo,
+        },
+      });
+    } else {
+      result = await chrome.runtime.sendMessage({
+        action: "relayToContent",
+        payload: { action: "getCurrentTime" },
+      });
+    }
 
-    if (!result.success || !result.response) return;
+    if (!result?.success || !result.response) return;
 
     const currentTime = result.response.currentTime || 0;
     highlightActiveEntry(currentTime);
   } catch (error) {
-    // Silently ignore — YouTube tab might be closed or navigated away
+    // Silently ignore — the video tab might be closed or navigated away
   }
 }
 
@@ -2625,9 +3525,6 @@ function renderTranscriptModeRows(segments, mode) {
   if (!transcriptList) return [];
   transcriptList.innerHTML = "";
 
-  const existingBadge = document.getElementById("transcriptSourceBadge");
-  if (existingBadge) existingBadge.remove();
-
   const rows = [];
   segments.forEach((segment, index) => {
     const div = document.createElement("div");
@@ -2652,6 +3549,11 @@ function renderTranscriptModeRows(segments, mode) {
     transcriptList.appendChild(div);
     rows.push(div);
   });
+
+  // The provenance row is independent of the row repaint: every repaint path
+  // restores it (a no-op outside Bilibili), so switching language modes can
+  // never make the source/partial hint/refresh button vanish.
+  renderTranscriptSourceBadge();
 
   // Bilingual mode can find source text before each translation arrives.
   refreshTranscriptSearch({ preserveIndex: false, scroll: false });
@@ -2812,6 +3714,7 @@ function retryTranslationSegment(index, generation) {
 async function translateTranscript() {
   const segments = getActiveTranscriptSegments();
   if (!segments.length || currentTranscriptMode === "original") return;
+  if (currentPlatform === "bilibili" && !(await ensureBilibiliAiKey())) return;
 
   const generation = translationGeneration;
   const videoId = currentVideoId;
@@ -2904,4 +3807,46 @@ globalThis.__YTD_TRANSCRIPT_TESTING__ = {
   getNavigationUrl,
   renderSubtitleInlineMarkup,
   renderTranscriptSegmentContent,
+  // Bilibili pipeline (protocol-stub tested)
+  parseBilibiliVideoUrl,
+  bilibiliLocatorFingerprint,
+  serializeBilibiliLocator,
+  checkCurrentTab,
+  handleFrontTabUrl,
+  startBilibiliDigest,
+  applyBilibiliTranscriptResponse,
+  handleBilibiliMessageError,
+  showBilibiliRateLimited,
+  bilibiliSourceLabel,
+  renderTranscriptSourceBadge,
+  syncBilibiliLanguageModes,
+  resetTranscriptSourceState,
+  invalidateBilibiliDerivedCaches,
+  ensureBilibiliAiKey,
+  bilibiliSeek,
+  saveBilibiliNoteRequest,
+  exportTranscript,
+  getBilibiliPanelState() {
+    return {
+      currentPlatform,
+      currentVideoId,
+      currentVideoUrl,
+      bilibiliTabId,
+      youtubeTabId,
+      currentBilibiliVideo,
+      currentBilibiliLocator,
+      currentBilibiliFingerprint,
+      currentTranscriptSource,
+      currentOriginalAvailable,
+      currentCoverage,
+      currentTranscript,
+      currentTranscriptText,
+      currentTranscriptLanguage,
+      currentAnalysis,
+      currentVideoTitle,
+      currentChannelName,
+      transcriptParagraphCacheSize: transcriptParagraphCache.size,
+      interfaceTranslationCacheSize: interfaceTranslationCache.size,
+    };
+  },
 };
